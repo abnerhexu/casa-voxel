@@ -6,12 +6,8 @@ component power-density tables used in the current thermal analysis.
 The scripts call the simulator at the repository root and write outputs under
 `results/`.  They assume the current checked-in simulator code, including:
 
-- Jouppi TPUv4i arithmetic-energy constants in `t10_TensorExpression.py`
-  (`ADD_PJ=0.11`, `MUL_PJ=0.21`).
-- TSIM-derived absolute logic areas for SRAM, SA, VU, router, and per-core TSV
-  blocks in the intra-core floorplan.
-- 3D-ICE stack export with 8 HBM DRAM layers, bank-level DRAM floorplans, address
-  trace mapping, and DSENT TG11LVT NoC power.
+- TSIM-derived energy consumptions, logic areas, and floorplans of SRAM, SA, VU, router, and TSV blocks.
+- 3D-ICE stack export with 8 HBM DRAM layers, bank-level DRAM floorplans, address trace mapping, and DSENT TG11LVT NoC power.
 
 ## Workloads
 
