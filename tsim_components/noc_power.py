@@ -64,7 +64,7 @@ class NoCPowerCharacterization:
 
 
 def repo_root_from_src() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
 
 
 def simple_energy_j_per_flit(cfg: NoCPowerConfig) -> float:
