@@ -62,7 +62,8 @@ bash scripts/setup_external_backends.sh
 ```
 
 Builds HotSpot, 3D-ICE, DSENT, ORION, etc. for detailed thermal analysis.
-Not mandatory for AE — the simulator can fall back to built-in analytical models.
+
+Note: Not mandatory for AE — the simulator can fall back to built-in analytical models.
 
 ---
 
