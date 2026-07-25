@@ -51,6 +51,12 @@ Packages: `numpy==1.26.4`, `ujson`, `scikit-learn`, `scipy`, `linear-tree`, `mat
 
 ### 1.4 External Backends (Optional)
 
+Install required system packages for the backend:
+```sudo apt-get update
+sudo apt-get install -y build-essential curl git tar unzip flex bison libopenblas-dev
+```
+
+Install simulation backends:
 ```bash
 bash scripts/setup_external_backends.sh
 ```
