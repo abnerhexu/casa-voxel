@@ -37,8 +37,8 @@ Layer counts used by these scripts:
 The thermal run settings are:
 
 - Engine: 3D-ICE emulator via `benchmark_scripts/run_thermal_cooler_matrix.py`.
-- Cooling profile: `sxm_air`.
-- Ambient: 35 C.
+- Cooling profile: `pcie_air` (`R_convec = 0.12 K/W`).
+- Ambient: 25 C.
 - Bond/underfill thickness: 10 um.
 - DRAM layers: 8.
 - HotSpot/thermal grid: 128.

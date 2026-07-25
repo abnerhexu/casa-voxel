@@ -28,7 +28,7 @@ from tsim_thermal.visualization import FlpBlock, read_flp
 
 
 COOLING_PROFILES: Tuple[Tuple[str, float], ...] = (
-    ("pcie_air", 0.13),
+    ("pcie_air", 0.12),
     ("sxm_air", 0.06),
     ("high_perf_liquid", 0.02),
 )
