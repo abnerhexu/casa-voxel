@@ -43,11 +43,9 @@ DATAMOVE_PJ = 12
 TSV_PJ_PER_BYTE = DATAMOVE_PJ * 0.05
 # Reference: Jouppi et al., "Ten Lessons From Three Generations Shaped Google's TPUv4i"
 # (https://www.cs.cmu.edu/~18742/papers/Jouppi2021.pdf)
-# TPUv4i measured: MUL_PJ=0.21, ADD_PJ=0.11 (FP16).  We use conservative 5 nm estimates.
-# MUL_PJ = 0.34 # 7nm
-MUL_PJ = 0.30 # 5nm (est.) - FP16 multiply; cf. Jouppi et al. "Ten Lessons From Three Generations Shaped Google's TPUv4i" (2021) reports 0.21 pJ for FP16 mul on TPUv4i
-# ADD_PJ = 0.16 # 7nm
-ADD_PJ = 0.14 # 5nm (est.) - FP16 add; cf. Jouppi et al. (2021) reports 0.11 pJ for FP16 add on TPUv4i
+# TPUv4i 7 nm BF16 values reported in Table 2.
+MUL_PJ = 0.21
+ADD_PJ = 0.11
 
 
 SHIFT_INSTR_BYTE_PER_CYCLE = 3
