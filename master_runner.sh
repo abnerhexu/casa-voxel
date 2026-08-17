@@ -89,7 +89,7 @@ if [ "$RUN_SIM" -eq 1 ]; then
     echo " Started at: $(date)"
     echo "============================================"
 
-    # 4-group decomposition.
+    # 5-group decomposition.
 
     # Group A1: Mode 2 prefill (dit-xl needed for Fig 15 prefill row).
     #   Mode 2 → Fig 11,15,18,19 (prefill rows).
@@ -108,6 +108,17 @@ if [ "$RUN_SIM" -eq 1 ]; then
         --decode-parallel-limit 3 \
         --exclude-models dit-xl
     echo "Group A2 (modes 2,5,7,9 decode + 5,7,9 prefill) done at: $(date)"
+
+    # Group A3: Mode 2 decode, dit-xl only.
+    #   Fig 15's prefill row reads DiT-XL from decode bs_32 logs (scaled x10
+    #   for 10 denoising iters), not from the bs_1 prefill logs Group A1
+    #   writes.  Sweep exactly the 5 params Fig 15 plots; the default anchor
+    #   point (sa=32, sram=2048, cores=256, cg=8, nocbw=16, dram=12288)
+    #   already exists from Group B (mode 3) and is skipped automatically.
+    python3 -u run_all_modes.py --modes 2 --model dit-xl \
+        --sweep-params 'noc_bw,dram_bw,sa,num_cores,sram_kb' \
+        --decode-parallel-limit 3
+    echo "Group A3 (mode 2 decode, dit-xl) done at: $(date)"
 
     # Group B: Mode 3 decode only (dit-xl needed for Fig 17 smile curve).
     #   Mode 3 → Fig 17
