@@ -49,8 +49,8 @@ def parse_summary_text(content: str) -> Dict:
     if len(lines) > 4:
         _components(lines[4], summary, "dynamic")
 
-    if len(lines) > 5:
-        pl = lines[5]
+    pl = next((line for line in lines[:20] if line.startswith("Power (w):")), "")
+    if pl:
         for key, pat in (("avg_power_w", r"Power \(w\): ([\d.eE+-]+)"),
                          ("static_power_w", r"Static: ([\d.eE+-]+) W"),
                          ("dynamic_power_w", r"Dyn\.: ([\d.eE+-]+) W")):
@@ -64,13 +64,14 @@ def parse_summary_text(content: str) -> Dict:
         if v is not None:
             summary["static_power_logic_w"] = v
 
-    if len(lines) > 6:
-        v = _f(r"Overall Util: ([\d.eE+-]+)", lines[6])
+    util_line = next((line for line in lines[:20] if line.startswith("Overall Util:")), "")
+    if util_line:
+        v = _f(r"Overall Util: ([\d.eE+-]+)", util_line)
         if v is not None:
             summary["overall_util"] = v
 
-    if len(lines) > 7:
-        cl = lines[7]
+    cl = next((line for line in lines[:20] if line.startswith("DRAM UTIL")), "")
+    if cl:
         m = re.search(r"DRAM UTIL \(%\): ([\d.eE+-]+)/([\d.eE+-]+)", cl)
         if m:
             summary["dram_r_util"] = float(m.group(1))
@@ -92,7 +93,7 @@ def parse_summary_text(content: str) -> Dict:
             summary["vu_gflops"] = v
 
     noc_bh_line = next(
-        (line for line in lines[:16] if line.startswith("NoC traffic x hops")),
+        (line for line in lines[:20] if line.startswith("NoC traffic x hops")),
         "",
     )
     if noc_bh_line:
@@ -103,6 +104,50 @@ def parse_summary_text(content: str) -> Dict:
             ("noc_reduce_byte_hops", r"Reduce=([\d.eE+-]+)"),
         ):
             value = _f(pat, noc_bh_line)
+            if value is not None:
+                summary[key] = value
+
+    dram_conflict_line = next(
+        (line for line in lines[:20] if line.startswith("DRAM row conflicts")),
+        "",
+    )
+    if dram_conflict_line:
+        for key, pat in (
+            ("dram_row_conflicts", r"Total=([\d.eE+-]+)"),
+            ("dram_r_row_conflicts", r"Read=([\d.eE+-]+)"),
+            ("dram_w_row_conflicts", r"Write=([\d.eE+-]+)"),
+        ):
+            value = _f(pat, dram_conflict_line)
+            if value is not None:
+                summary[key] = value
+
+    dram_energy_line = next(
+        (line for line in lines[:20]
+         if line.startswith("DRAM dynamic energy breakdown")),
+        "",
+    )
+    if dram_energy_line:
+        for key, pat in (
+            ("dynamic_dram_base_mj", r"Base=([\d.eE+-]+)"),
+            ("dynamic_dram_row_conflict_mj", r"RowConflict=([\d.eE+-]+)"),
+            ("dynamic_dram_mj", r"Total=([\d.eE+-]+)"),
+        ):
+            value = _f(pat, dram_energy_line)
+            if value is not None:
+                summary[key] = value
+
+    dram_power_line = next(
+        (line for line in lines[:20]
+         if line.startswith("DRAM dynamic power (workload average)")),
+        "",
+    )
+    if dram_power_line:
+        for key, pat in (
+            ("dynamic_power_dram_base_w", r"Base=([\d.eE+-]+)"),
+            ("dynamic_power_dram_row_conflict_w", r"RowConflict=([\d.eE+-]+)"),
+            ("dynamic_power_dram_w", r"Total=([\d.eE+-]+)"),
+        ):
+            value = _f(pat, dram_power_line)
             if value is not None:
                 summary[key] = value
 
@@ -140,6 +185,16 @@ _NOC_BYTE_HOPS_RE = re.compile(
     r"Total=([\d.eE+-]+),\s*Broadcast=([\d.eE+-]+),\s*"
     r"Shift=([\d.eE+-]+),\s*Reduce=([\d.eE+-]+)"
 )
+_DRAM_CONFLICT_RE = re.compile(
+    r"DRAM row conflicts \(ACT\+PRE\):\s*"
+    r"Total=([\d.eE+-]+),\s*Read=([\d.eE+-]+),\s*"
+    r"Write=([\d.eE+-]+),\s*Energy=([\d.eE+-]+) pJ"
+)
+_DRAM_DYNAMIC_POWER_RE = re.compile(
+    r"DRAM dynamic power \(W\):\s*"
+    r"Total=([\d.eE+-]+),\s*Base=([\d.eE+-]+),\s*"
+    r"RowConflict=([\d.eE+-]+)"
+)
 _POWER_RE = re.compile(r"Average Power \(W\):\s*([\d.eE+-]+)")
 
 
@@ -157,7 +212,7 @@ def parse_operators_text(content: str) -> List[Dict]:
         dur_m = _DUR_RE.search(lines[i + 2])
         util_m = _UTIL_RE.search(lines[i + 3])
         bytes_m = _BYTES_RE.search(lines[i + 4])
-        trailing_lines = lines[i + 5:min(i + 8, n)]
+        trailing_lines = lines[i + 5:min(i + 10, n)]
         noc_byte_hops_m = next(
             (_NOC_BYTE_HOPS_RE.search(candidate) for candidate in trailing_lines
              if _NOC_BYTE_HOPS_RE.search(candidate)),
@@ -166,6 +221,17 @@ def parse_operators_text(content: str) -> List[Dict]:
         power_m = next(
             (_POWER_RE.search(candidate) for candidate in trailing_lines
              if _POWER_RE.search(candidate)),
+            None,
+        )
+        dram_conflict_m = next(
+            (_DRAM_CONFLICT_RE.search(candidate) for candidate in trailing_lines
+             if _DRAM_CONFLICT_RE.search(candidate)),
+            None,
+        )
+        dram_dynamic_power_m = next(
+            (_DRAM_DYNAMIC_POWER_RE.search(candidate)
+             for candidate in trailing_lines
+             if _DRAM_DYNAMIC_POWER_RE.search(candidate)),
             None,
         )
         if not (start_m and dur_m and util_m and bytes_m):
@@ -193,6 +259,13 @@ def parse_operators_text(content: str) -> List[Dict]:
             "noc_bcast_byte_hops": float(noc_byte_hops_m.group(2)) if noc_byte_hops_m else 0.0,
             "noc_shift_byte_hops": float(noc_byte_hops_m.group(3)) if noc_byte_hops_m else 0.0,
             "noc_reduce_byte_hops": float(noc_byte_hops_m.group(4)) if noc_byte_hops_m else 0.0,
+            "dram_row_conflicts": float(dram_conflict_m.group(1)) if dram_conflict_m else 0.0,
+            "dram_r_row_conflicts": float(dram_conflict_m.group(2)) if dram_conflict_m else 0.0,
+            "dram_w_row_conflicts": float(dram_conflict_m.group(3)) if dram_conflict_m else 0.0,
+            "energy_dram_row_conflict_pj": float(dram_conflict_m.group(4)) if dram_conflict_m else 0.0,
+            "dram_dynamic_power_w": float(dram_dynamic_power_m.group(1)) if dram_dynamic_power_m else 0.0,
+            "dram_base_dynamic_power_w": float(dram_dynamic_power_m.group(2)) if dram_dynamic_power_m else 0.0,
+            "dram_row_conflict_dynamic_power_w": float(dram_dynamic_power_m.group(3)) if dram_dynamic_power_m else 0.0,
             "avg_power_w": float(power_m.group(1)) if power_m else 0.0,
         })
     return operators

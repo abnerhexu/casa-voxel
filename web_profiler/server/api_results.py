@@ -273,6 +273,16 @@ def result_op_energy():
             "energy_vu_mj": op.energy_vu * pj_to_mj,
             "energy_sram_mj": op.energy_sram * pj_to_mj,
             "energy_dram_mj": op.energy_dram * pj_to_mj,
+            "energy_dram_base_mj": getattr(op, "energy_dram_base", op.energy_dram) * pj_to_mj,
+            "energy_dram_row_conflict_mj": getattr(op, "energy_dram_row_conflict", 0.0) * pj_to_mj,
+            "dram_row_conflicts": getattr(op, "dram_row_conflicts", 0),
+            "dram_r_row_conflicts": getattr(op, "dram_r_row_conflicts", 0),
+            "dram_w_row_conflicts": getattr(op, "dram_w_row_conflicts", 0),
+            "dram_dynamic_power_w": getattr(op, "dram_dynamic_power_W", 0.0),
+            "dram_base_dynamic_power_w": getattr(op, "dram_base_dynamic_power_W", 0.0),
+            "dram_row_conflict_dynamic_power_w": getattr(
+                op, "dram_row_conflict_dynamic_power_W", 0.0
+            ),
             "energy_noc_mj": op.energy_noc * pj_to_mj,
             "energy_tsv_mj": op.energy_tsv * pj_to_mj,
             "energy_compute_mj": op.energy_compute * pj_to_mj,

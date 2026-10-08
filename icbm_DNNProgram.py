@@ -71,6 +71,12 @@ PREFILL = False
 
 INNER_GB = 1
 
+STACKED_3D_DRAM_PJ_PER_BYTE = 7
+"""Baseline dynamic energy for transferring one byte to/from stacked DRAM."""
+
+DRAM_ACT_PRE_ENERGY_PJ = 7.27 * 1_000
+"""Additional dynamic energy of one row-conflict PRE+ACT pair (7.27 nJ)."""
+
 def convert_tuple_to_list(t):
     """Recursively convert nested tuples to nested lists."""
     return [convert_tuple_to_list(x) for x in t] if isinstance(t, tuple) else t
@@ -1246,12 +1252,14 @@ class DNNProgram:
                 tuples, one per sub-operator.
 
         Returns:
-            A 9-tuple::
+            A 12-tuple::
 
                 (dram_r_cycles, dram_w_cycles_intermediate,
                  last_op_dram_w_cycles,
                  dram_r_bytes, dram_w_bytes_intermediate,
                  last_op_dram_w_bytes, last_op_unconditional,
+                 dram_r_row_conflicts, dram_w_row_conflicts_intermediate,
+                 last_op_dram_w_row_conflicts,
                  dram_access_records, last_op_write_records)
 
             ``dram_access_records`` contains reads and any immediate writes.
@@ -1260,6 +1268,9 @@ class DNNProgram:
         """
         dram_r_cycles, dram_w_cycles_intermediate, last_op_dram_w_cycles = (0, 0, 0)
         dram_r_bytes, dram_w_bytes_intermediate, last_op_dram_w_bytes = (0, 0, 0)
+        dram_r_row_conflicts = 0
+        dram_w_row_conflicts_intermediate = 0
+        last_op_dram_w_row_conflicts = 0
         dram_access_records = []
         last_op_write_records = []
         last_idx = len(fused_op) - 1
@@ -1267,12 +1278,13 @@ class DNNProgram:
             (temporal, spatial) = next(partition_it)
             # Single call returns cycles, bytes, and access granularity,
             # avoiding duplicate precise/ultra-precise DRAM simulations.
-            access_list_cycles, access_list_bytes, access_list_granularity = dram.get_dram_access_list(
+            (access_list_cycles, access_list_bytes, access_list_granularity,
+             access_list_row_conflicts) = dram.get_dram_access_list(
                                         op.expr.get_sub_op_var_sizes(temporal, spatial, False),
                                         op.expr.get_temporal_var_replicas(temporal, spatial),
                                         core_group_size,
                                         op.expr.num_byte_per_elem,
-                                        return_cycles_bytes_granularity=True,
+                                        return_cycles_bytes_granularity_conflicts=True,
                                         bad_mapping=self.uniform_dram_mapping,
                                         )
             ignore_list = op.expr.ignore_variables
@@ -1282,14 +1294,16 @@ class DNNProgram:
             # get_per_cycle_bytes_per_core uses 2^30 (binary GiB) and floor division,
             # so the correct inverse is / 2^40 (not / 1e12). ~1% error from floor div.
             std_time_fac = 1
-            for tensor_index, (load_time, load_bytes, granularity, ignore) in enumerate(
-                zip(access_list_cycles[1:], access_list_bytes[1:], access_list_granularity[1:], ignore_list[1:]),
+            for tensor_index, (load_time, load_bytes, granularity, row_conflicts, ignore) in enumerate(
+                zip(access_list_cycles[1:], access_list_bytes[1:], access_list_granularity[1:],
+                    access_list_row_conflicts[1:], ignore_list[1:]),
                 start=1,
             ):
                 if not ignore:
                     scaled_load_time = load_time * std_time_fac
                     dram_r_cycles += scaled_load_time
                     dram_r_bytes += load_bytes
+                    dram_r_row_conflicts += row_conflicts
                     dram_access_records.append({
                         "version": 1,
                         "source": "tsim_get_dram_access_list",
@@ -1300,6 +1314,8 @@ class DNNProgram:
                         "bytes_per_core": int(load_bytes),
                         "total_bytes": int(load_bytes * self.tot_num_cores),
                         "access_granularity_bytes": int(granularity),
+                        "row_conflicts_per_core": int(row_conflicts),
+                        "total_row_conflicts": int(row_conflicts * self.tot_num_cores),
                         "cycles_per_core": int(load_time),
                         "scheduled_cycles": int(scaled_load_time),
                         "ignored": False,
@@ -1308,6 +1324,7 @@ class DNNProgram:
                 # Last sub-op: defer write decision to caller
                 last_op_dram_w_cycles = access_list_cycles[0]
                 last_op_dram_w_bytes = access_list_bytes[0]
+                last_op_dram_w_row_conflicts = access_list_row_conflicts[0]
                 last_op_unconditional = op.is_unconditional_write
                 last_op_write_records.append({
                     "version": 1,
@@ -1319,6 +1336,8 @@ class DNNProgram:
                     "bytes_per_core": int(access_list_bytes[0]),
                     "total_bytes": int(access_list_bytes[0] * self.tot_num_cores),
                     "access_granularity_bytes": int(access_list_granularity[0]),
+                    "row_conflicts_per_core": int(access_list_row_conflicts[0]),
+                    "total_row_conflicts": int(access_list_row_conflicts[0] * self.tot_num_cores),
                     "cycles_per_core": int(access_list_cycles[0]),
                     "scheduled_cycles": int(access_list_cycles[0]),
                     "ignored": False,
@@ -1329,6 +1348,7 @@ class DNNProgram:
                 # Intermediate sub-op that must write (e.g. KV-cache update)
                 dram_w_cycles_intermediate += access_list_cycles[0]
                 dram_w_bytes_intermediate += access_list_bytes[0]
+                dram_w_row_conflicts_intermediate += access_list_row_conflicts[0]
                 dram_access_records.append({
                     "version": 1,
                     "source": "tsim_get_dram_access_list",
@@ -1339,6 +1359,8 @@ class DNNProgram:
                     "bytes_per_core": int(access_list_bytes[0]),
                     "total_bytes": int(access_list_bytes[0] * self.tot_num_cores),
                     "access_granularity_bytes": int(access_list_granularity[0]),
+                    "row_conflicts_per_core": int(access_list_row_conflicts[0]),
+                    "total_row_conflicts": int(access_list_row_conflicts[0] * self.tot_num_cores),
                     "cycles_per_core": int(access_list_cycles[0]),
                     "scheduled_cycles": int(access_list_cycles[0]),
                     "ignored": False,
@@ -1347,7 +1369,8 @@ class DNNProgram:
 
         return int(dram_r_cycles), int(dram_w_cycles_intermediate), int(last_op_dram_w_cycles), \
                 int(dram_r_bytes), int(dram_w_bytes_intermediate), int(last_op_dram_w_bytes), last_op_unconditional, \
-                dram_access_records, last_op_write_records
+                int(dram_r_row_conflicts), int(dram_w_row_conflicts_intermediate), \
+                int(last_op_dram_w_row_conflicts), dram_access_records, last_op_write_records
     def get_noc_times(self, fused_op: List[TensorOperator], partition_it, noc_data_it=None, noc: Optional[NoC] = None):
         """Sum the NoC cycle costs of all sub-operators in a fused group.
 
@@ -1482,7 +1505,8 @@ class DNNProgram:
 
     def get_fused_op_energy_from_scratch(self, fused_op: List[TensorOperator],
                                          part_it, dram_r_traffic: int = 0,
-                                         dram_w_traffic: int = 0) -> Tuple[float, float, float, dict]:
+                                         dram_w_traffic: int = 0,
+                                         dram_row_conflicts: int = 0) -> Tuple[float, float, float, dict]:
         """Compute the total dynamic energy for a fused operator group.
 
         Sums per-sub-operator on-chip energy (SA, VU, SRAM, NoC) from the
@@ -1494,6 +1518,8 @@ class DNNProgram:
             part_it: Iterator yielding ``(temporal, spatial)`` per sub-op.
             dram_r_traffic: Total DRAM read bytes (all cores combined).
             dram_w_traffic: Total DRAM write bytes (all cores combined).
+            dram_row_conflicts: Chip-wide number of PRE+ACT row-conflict
+                pairs across reads and writes.
 
         Returns:
             A 4-tuple ``(total_dynamic_energy_pJ, compute_energy_pJ,
@@ -1514,13 +1540,18 @@ class DNNProgram:
                 per_component_energy[component] += energy_breakdown[component]
 
         # --- Off-chip energy: DRAM and TSV ---
-        # Energy-per-byte references (pJ/byte):
+        # Baseline transfer energy references (pJ/byte):
         #   HBM:  7 pJ/bit  => 56 pJ/byte  (https://docs.amd.com/v/u/en-US/wp485-hbm)
         #   HBM2: 3.9 pJ/bit => 31.2 pJ/byte (https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=8686544)
         #   HBM3: 3.4 pJ/bit => 27.2 pJ/byte (https://passlab.github.io/mchpc/mchpc2019/presentations/MCHPC_Pawlowski_keynote.pdf)
         #   3D-stacked DRAM: 7 pJ/byte (https://dl.acm.org/doi/10.1145/3695794.3695799)
-        STACKED_3D_DRAM_PJ_PER_BYTE = 7
-        dram_dyn_energy = (dram_r_traffic + dram_w_traffic) * STACKED_3D_DRAM_PJ_PER_BYTE
+        dram_base_energy = (
+            (dram_r_traffic + dram_w_traffic) * STACKED_3D_DRAM_PJ_PER_BYTE
+        )
+        # A row conflict closes the currently open row and opens a new one.
+        # Charge one measured PRE+ACT pair (7.27 nJ) for every such event.
+        dram_row_conflict_energy = dram_row_conflicts * DRAM_ACT_PRE_ENERGY_PJ
+        dram_dyn_energy = dram_base_energy + dram_row_conflict_energy
         # TSV energy: ~0.5 pJ/byte (https://ieeexplore.ieee.org/document/6159032)
         tsv_energy = (dram_r_traffic + dram_w_traffic) * 0.05 * DATAMOVE_PJ
         per_component_energy["dram"] = dram_dyn_energy
@@ -1636,6 +1667,7 @@ class DNNProgram:
 
             # --- 3. DRAM cycles and byte traffic ---
             read_cycles, write_cycles, last_op_wr_cycles, dram_r_traffic, dram_w_traffic, last_op_wr_traffic, last_op_unconditional, \
+                dram_r_row_conflicts, dram_w_row_conflicts, last_op_w_row_conflicts, \
                 dram_access_records, last_op_write_records \
                 = self.get_dram_time(fused_op, dram, core_group_size, dram_part_it)
             # Include the last sub-op's write only if its output must go to DRAM
@@ -1643,6 +1675,7 @@ class DNNProgram:
             used_by_next = last_op_unconditional or self.used_by_next_fused_op(idx, fused_ops)
             write_cycles += last_op_wr_cycles if used_by_next else 0
             dram_w_traffic += last_op_wr_traffic if used_by_next else 0
+            dram_w_row_conflicts += last_op_w_row_conflicts if used_by_next else 0
             if used_by_next:
                 dram_access_records.extend(last_op_write_records)
 
@@ -1660,13 +1693,35 @@ class DNNProgram:
             # Scale per-core byte traffic to chip-wide totals for energy model
             total_dram_r_traffic = dram_r_traffic * self.tot_num_cores
             total_dram_w_traffic = dram_w_traffic * self.tot_num_cores
+            total_dram_r_row_conflicts = dram_r_row_conflicts * self.tot_num_cores
+            total_dram_w_row_conflicts = dram_w_row_conflicts * self.tot_num_cores
+            total_dram_row_conflicts = (
+                total_dram_r_row_conflicts + total_dram_w_row_conflicts
+            )
             dram_op_traffic.append((total_dram_r_traffic, total_dram_w_traffic))
-            fused_op_energy.append(self.get_fused_op_energy_from_scratch(
-                fused_op, energy_part_it, total_dram_r_traffic, total_dram_w_traffic))
-            spatial_meta.append(self._build_fused_spatial_meta(
+            op_energy = self.get_fused_op_energy_from_scratch(
+                fused_op, energy_part_it, total_dram_r_traffic,
+                total_dram_w_traffic, total_dram_row_conflicts)
+            fused_op_energy.append(op_energy)
+            op_spatial_meta = self._build_fused_spatial_meta(
                 idx, fused_op, partitions, core_group_size, noc,
                 total_dram_r_traffic, total_dram_w_traffic,
-                dram_access_records))
+                dram_access_records)
+            op_spatial_meta["dram_row_conflicts"] = {
+                "read": int(total_dram_r_row_conflicts),
+                "write": int(total_dram_w_row_conflicts),
+                "total": int(total_dram_row_conflicts),
+            }
+            op_spatial_meta["dram_energy_breakdown_pj"] = {
+                "base_transfer": float(
+                    (total_dram_r_traffic + total_dram_w_traffic)
+                    * STACKED_3D_DRAM_PJ_PER_BYTE
+                ),
+                "row_conflict": float(
+                    total_dram_row_conflicts * DRAM_ACT_PRE_ENERGY_PJ
+                ),
+            }
+            spatial_meta.append(op_spatial_meta)
 
         return dram_op_traffic, dram_op_times, noc_op_times, agg_hot_cold_table, fused_op_energy, comp_unit_stats, spatial_meta
 
@@ -1844,7 +1899,7 @@ class DNNProgram:
         dram_op_traffic = []
         for idx, fused_op in enumerate(fused_ops):
             read_cycles, write_cycles, last_op_wr_cycles, dram_r_traffic, dram_w_traffic, last_op_wr_traffic, last_op_unconditional, \
-                _, _ \
+                _, _, _, _, _ \
                 = self.get_dram_time(fused_op, dram, core_group_size, dram_part_it)
             dram_w_traffic += last_op_wr_traffic if (last_op_unconditional or self.used_by_next_fused_op(idx, fused_ops)) else 0
             total_dram_r_traffic = dram_r_traffic * self.tot_num_cores
@@ -1917,6 +1972,11 @@ class DNNProgram:
             "noc_energy": 0,
             "sram_energy": 0,
             "dram_energy": 0,
+            "dram_base_energy": 0,
+            "dram_row_conflict_energy": 0,
+            "dram_row_conflicts": 0,
+            "dram_r_row_conflicts": 0,
+            "dram_w_row_conflicts": 0,
             "tsv_energy": 0,
             "dram_r_util": 0.0,   # NOTE: initially bytes, converted to util later
             "dram_w_util": 0.0,
@@ -2019,6 +2079,11 @@ class DNNProgram:
                 stats["noc_energy"] += op_exec_breakdown.energy_noc
                 stats["sram_energy"] += op_exec_breakdown.energy_sram
                 stats["dram_energy"] += op_exec_breakdown.energy_dram
+                stats["dram_base_energy"] += op_exec_breakdown.energy_dram_base
+                stats["dram_row_conflict_energy"] += op_exec_breakdown.energy_dram_row_conflict
+                stats["dram_row_conflicts"] += op_exec_breakdown.dram_row_conflicts
+                stats["dram_r_row_conflicts"] += op_exec_breakdown.dram_r_row_conflicts
+                stats["dram_w_row_conflicts"] += op_exec_breakdown.dram_w_row_conflicts
                 stats["tsv_energy"] += op_exec_breakdown.energy_tsv
                 stats["dram_r_util"] += op_exec_breakdown.dram_r_bytes
                 stats["dram_w_util"] += op_exec_breakdown.dram_w_bytes

@@ -419,6 +419,39 @@ class DRAM:
 
         return int(max(1, cycle))
 
+    def num_row_conflicts_of_access(self, num_bytes: int,
+                                    access_granularity_bytes: int,
+                                    need_init: bool = False) -> int:
+        """Estimate ACT+PRE row-conflict pairs for one DRAM access.
+
+        The access stream uses the same chunking assumption as the precise
+        timing model: each contiguous granularity-sized chunk occupies a new
+        row and chunks are striped round-robin across the banks.  The first
+        row opened in a bank is an initial row miss (ACT only), not a row
+        conflict.  Each later row mapped to that bank replaces an open row
+        and therefore contributes one PRE+ACT pair.
+
+        ``need_init`` affects whether the first access can hit a pre-opened
+        row, but it does not change the number of later row replacements, so
+        it is accepted for API symmetry with :meth:`num_cycle_of_access`.
+        SRAM-only configurations report no DRAM conflicts.
+        """
+        del need_init
+        if num_bytes <= 0 or self.use_sram:
+            return 0
+
+        bytes_per_burst = max(1, int(self.bytes_per_cycle))
+        bytes_per_row = max(bytes_per_burst, int(self.bytes_per_row))
+        granularity = max(
+            bytes_per_burst,
+            min(int(access_granularity_bytes), bytes_per_row),
+        )
+        bursts_per_chunk = max(1, granularity // bytes_per_burst)
+        num_bursts = (int(num_bytes) + bytes_per_burst - 1) // bytes_per_burst
+        num_chunks = (num_bursts + bursts_per_chunk - 1) // bursts_per_chunk
+        num_banks = max(1, int(self.num_banks_per_channel))
+        return max(0, num_chunks - num_banks)
+
     def _precise_num_cycle_of_access(self,
                                      num_bytes: int,
                                      access_granularity_bytes: int,
@@ -618,6 +651,7 @@ class DRAM:
                              return_tot_bytes_per_core: bool = False,
                              return_cycles_and_bytes: bool = False,
                              return_cycles_bytes_granularity: bool = False,
+                             return_cycles_bytes_granularity_conflicts: bool = False,
                              opti_intra_mapping: bool = False,
                              bad_mapping: bool = False):
         """Compute per-tensor DRAM access costs for a list of tensors.
@@ -638,6 +672,8 @@ class DRAM:
         * ``return_cycles_and_bytes`` -- tuple of (cycles_list, bytes_list).
         * ``return_cycles_bytes_granularity`` -- tuple of (cycles_list,
           bytes_list, granularity_list).
+        * ``return_cycles_bytes_granularity_conflicts`` -- tuple of
+          (cycles_list, bytes_list, granularity_list, row_conflicts_list).
         * *(default)* -- list of access cycle counts.
 
         Parameters
@@ -659,8 +695,10 @@ class DRAM:
             use only half their last dimension for granularity.
         """
         dram_access_list: List[float] = []
-        dram_bytes_list: List[int] = [] if (return_cycles_and_bytes or return_cycles_bytes_granularity) else None
-        dram_granularity_list: List[int] = [] if return_cycles_bytes_granularity else None
+        detailed = return_cycles_bytes_granularity or return_cycles_bytes_granularity_conflicts
+        dram_bytes_list: List[int] = [] if (return_cycles_and_bytes or detailed) else None
+        dram_granularity_list: List[int] = [] if detailed else None
+        dram_row_conflicts_list: List[int] = [] if return_cycles_bytes_granularity_conflicts else None
 
         for i, (shape, replica) in enumerate(zip(tensor_shapes, temporal_var_replicas)):
             # Collapse singleton dimensions so they don't inflate the
@@ -710,7 +748,7 @@ class DRAM:
                                                               need_init)
                 dram_access_list.append(dram_access_cycles)
                 dram_bytes_list.append(tot_access_bytes)
-            elif return_cycles_bytes_granularity:
+            elif detailed:
                 need_init = not opti_intra_mapping
                 dram_access_cycles = self.num_cycle_of_access(tot_access_bytes,
                                                               dram_access_granularity_byte,
@@ -718,6 +756,14 @@ class DRAM:
                 dram_access_list.append(dram_access_cycles)
                 dram_bytes_list.append(tot_access_bytes)
                 dram_granularity_list.append(int(dram_access_granularity_byte))
+                if return_cycles_bytes_granularity_conflicts:
+                    dram_row_conflicts_list.append(
+                        self.num_row_conflicts_of_access(
+                            tot_access_bytes,
+                            dram_access_granularity_byte,
+                            need_init,
+                        )
+                    )
             else:
                 need_init = not opti_intra_mapping
                 dram_access_cycles = self.num_cycle_of_access(tot_access_bytes,
@@ -728,4 +774,7 @@ class DRAM:
             return dram_access_list, dram_bytes_list
         if return_cycles_bytes_granularity:
             return dram_access_list, dram_bytes_list, dram_granularity_list
+        if return_cycles_bytes_granularity_conflicts:
+            return (dram_access_list, dram_bytes_list, dram_granularity_list,
+                    dram_row_conflicts_list)
         return dram_access_list

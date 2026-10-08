@@ -455,6 +455,7 @@ if __name__ == "__main__":
     sa_flops, vu_flops = [], []
     dram_util = []
     noc_traffic_hops = []
+    dram_conflict_stats = []
     overlap_lists = []
 
     # Build one parameter tuple per candidate execution-space partition.
@@ -532,6 +533,12 @@ if __name__ == "__main__":
             stats["noc_shift_byte_hops"],
             stats["noc_reduce_byte_hops"],
         ))
+        dram_conflict_stats.append((
+            stats["dram_r_row_conflicts"],
+            stats["dram_w_row_conflicts"],
+            stats["dram_base_energy"],
+            stats["dram_row_conflict_energy"],
+        ))
         overlap_lists.append(overlap_list)
         logs.append(log)
 
@@ -554,4 +561,5 @@ if __name__ == "__main__":
                     seq_noc=args.seq_noc,
                     ipu_tsim=args.ipu_tsim,
                     dataflow=args.dataflow,
-                    noc_traffic_hops=noc_traffic_hops)
+                    noc_traffic_hops=noc_traffic_hops,
+                    dram_conflict_stats=dram_conflict_stats)

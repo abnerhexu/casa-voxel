@@ -548,9 +548,21 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         + stats["noc_shift_byte_hops"]
         + stats["noc_reduce_byte_hops"]
     )
+    # Preserve compatibility with custom/older DNNProgram implementations
+    # that return the pre-row-conflict stats schema.
+    stats.setdefault("dram_base_energy", stats.get("dram_energy", 0))
+    stats.setdefault("dram_row_conflict_energy", 0)
+    stats.setdefault("dram_row_conflicts", 0)
+    stats.setdefault("dram_r_row_conflicts", 0)
+    stats.setdefault("dram_w_row_conflicts", 0)
     per_comp_sum =  (stats["sa_energy"] + stats["vu_energy"] + stats["noc_energy"] + stats["dram_energy"] + stats["sram_energy"] + stats["tsv_energy"])
     assert math.isclose(stats["exec_energy"], per_comp_sum, rel_tol=1e-5), \
         f"Energy breakdown does not sum to total energy! total: {stats['exec_energy']} vs {per_comp_sum}"
+    assert math.isclose(
+        stats["dram_energy"],
+        stats["dram_base_energy"] + stats["dram_row_conflict_energy"],
+        rel_tol=1e-9,
+    ), "DRAM base and row-conflict energies do not sum to total DRAM energy"
     dram_bytes = prog.get_fused_dram_bytes_only(fused_ops=fused_ops, partitions=all_partitions, dram=dram,
                             use_largest_cold=use_largest_cold, exe_sram_per_core=exe_space,
                             core_group_size=core_group_size)
@@ -599,6 +611,11 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         stats["noc_reduce_byte_hops"] *= tot_layers / sim_layers
         stats["noc_byte_hops"] *= tot_layers / sim_layers
         stats["dram_energy"] = int(stats["dram_energy"] * tot_layers / sim_layers)
+        stats["dram_base_energy"] = int(stats["dram_base_energy"] * tot_layers / sim_layers)
+        stats["dram_row_conflict_energy"] = int(stats["dram_row_conflict_energy"] * tot_layers / sim_layers)
+        stats["dram_row_conflicts"] = int(stats["dram_row_conflicts"] * tot_layers / sim_layers)
+        stats["dram_r_row_conflicts"] = int(stats["dram_r_row_conflicts"] * tot_layers / sim_layers)
+        stats["dram_w_row_conflicts"] = int(stats["dram_w_row_conflicts"] * tot_layers / sim_layers)
         stats["tsv_energy"] = int(stats["tsv_energy"] * tot_layers / sim_layers)
 
         stats["sa_flops"] = int(stats["sa_flops"] * tot_layers / sim_layers)  # Per core
@@ -768,7 +785,8 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
                   spmd_compiler=False, seq_noc=False,
                   ipu_tsim=False,
                   dataflow=False,
-                  noc_traffic_hops: List[Tuple[float, float, float]] = None):
+                  noc_traffic_hops: List[Tuple[float, float, float]] = None,
+                  dram_conflict_stats: List[Tuple[int, int, float, float]] = None):
     """Post-process simulation results: select best configuration, log stats, and generate plots.
 
     For each hardware configuration in the input lists this function:
@@ -810,6 +828,9 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
         ipu_tsim: Flag for IPU-style synthetic comparison mode.
         noc_traffic_hops: Optional per-configuration tuples of
             ``(broadcast, shift, reduce)`` traffic in byte-hops.
+        dram_conflict_stats: Optional per-configuration tuples of
+            ``(read_conflicts, write_conflicts, base_energy_pJ,
+            row_conflict_energy_pJ)``.
     """
     import matplotlib.pyplot as plt
 
@@ -819,6 +840,9 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
     if noc_traffic_hops is not None:
         assert len(noc_traffic_hops) == len(exec_times), \
             "Each run should have one NoC byte-hop tuple"
+    if dram_conflict_stats is not None:
+        assert len(dram_conflict_stats) == len(exec_times), \
+            "Each run should have one DRAM row-conflict tuple"
     best_exec = -1
     best_exec_idx = -1
     #Find best config:
@@ -940,6 +964,27 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
         log_str += f"Static Energy: DRAM = {dram_static_power_W * exec_time_sec * 1e3 } mJ, TSV = {tsv_static_power_W * exec_time_sec * 1e3} mJ, NoC: {noc_static_power_W * exec_time_sec * 1e3} mJ\n"
         log_str += f"Dynamic Energy: SA = {sa_energy_pJ /1e9 } mJ, VU = {vu_energy_pJ / 1e9} mJ, SRAM= {sram_energy_pJ / 1e9} mJ, Core: {core_energy_J * 1e3} mJ, NoC: {noc_energy_pJ / 1e9} mJ\n"
         log_str += f"Dynamic Energy: DRAM = {dram_energy_pJ / 1e9} mJ, TSV = {tsv_energy_pJ / 1e9} mJ \n"
+        if dram_conflict_stats is not None:
+            (dram_r_conflicts, dram_w_conflicts,
+             dram_base_energy_pJ, dram_conflict_energy_pJ) = dram_conflict_stats[i]
+            log_str += (
+                "DRAM row conflicts (ACT+PRE): "
+                f"Total={dram_r_conflicts + dram_w_conflicts}, "
+                f"Read={dram_r_conflicts}, Write={dram_w_conflicts}, "
+                "EnergyPerConflict=7.27 nJ\n"
+            )
+            log_str += (
+                "DRAM dynamic energy breakdown: "
+                f"Base={dram_base_energy_pJ / 1e9} mJ, "
+                f"RowConflict={dram_conflict_energy_pJ / 1e9} mJ, "
+                f"Total={dram_energy_pJ / 1e9} mJ\n"
+            )
+            log_str += (
+                "DRAM dynamic power (workload average): "
+                f"Base={dram_base_energy_pJ / 1e12 / exec_time_sec} W, "
+                f"RowConflict={dram_conflict_energy_pJ / 1e12 / exec_time_sec} W, "
+                f"Total={dram_energy_pJ / 1e12 / exec_time_sec} W\n"
+            )
         log_str += f"Power (w): {dyn_power_W + static_power_W}, Static: {static_power_W} W (dram: {dram_static_power_W} logic: {logic_static_power_W}), Dyn.: {dyn_power_W} W\n"
         log_str += f"Overall Util: {overall_util}\n"
         log_str += f"DRAM UTIL (%): {dram_util[0] * 100}/{dram_util[1] * 100} (R/W), SA_UTIL:{sa_util}, VU_UTIL:{vu_util}, NOC: {noc_util}\n"

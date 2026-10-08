@@ -215,6 +215,24 @@ the detailed log and stored on each pickled `FusedOperatorExecLog` as
 `noc_reduce_byte_hops`; direct `run_tsim()` callers receive the corresponding
 aggregate keys in `stats`.
 
+DRAM dynamic energy includes both byte-transfer energy and an explicit row-
+conflict penalty:
+
+```text
+DRAM row conflicts (ACT+PRE): Total=..., Read=..., Write=..., EnergyPerConflict=7.27 nJ
+DRAM dynamic energy breakdown: Base=... mJ, RowConflict=... mJ, Total=... mJ
+DRAM dynamic power (workload average): Base=... W, RowConflict=... W, Total=... W
+```
+
+The base term is `(read_bytes + write_bytes) * 7 pJ/byte`. A conflict is
+counted when an access replaces an already-open row in the same bank; the
+initial ACT in an empty bank is not a conflict. Each conflict adds one
+PRE+ACT pair at 7.27 nJ (7270 pJ). Counts and energies are also exposed in
+`run_tsim()` statistics and per-operator pickle fields. The internal and
+external precise timing modes use a synthesized, bank-striped request stream,
+so these conflict counts reflect VOXEL's mapping model rather than a captured
+physical command trace.
+
 ### 3.4 Generate Figures (Figs 10–20)
 
 Once simulation data is ready (verify with the dry-run in Section 3.3), each

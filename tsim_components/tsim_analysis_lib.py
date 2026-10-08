@@ -402,6 +402,33 @@ class FusedOperatorExecLog:
         self.energy_sram        = energy[3]["sram"]
         self.energy_dram        = energy[3]["dram"]
         self.energy_tsv         = energy[3]["tsv"]
+        dram_meta = (spatial_meta or {}).get("dram_row_conflicts", {})
+        dram_energy_meta = (spatial_meta or {}).get("dram_energy_breakdown_pj", {})
+        self.dram_r_row_conflicts = int(dram_meta.get("read", 0))
+        self.dram_w_row_conflicts = int(dram_meta.get("write", 0))
+        self.dram_row_conflicts = int(
+            dram_meta.get(
+                "total",
+                self.dram_r_row_conflicts + self.dram_w_row_conflicts,
+            )
+        )
+        self.energy_dram_base = float(
+            dram_energy_meta.get("base_transfer", self.energy_dram)
+        )
+        self.energy_dram_row_conflict = float(
+            dram_energy_meta.get("row_conflict", 0.0)
+        )
+        exec_time_s = self.exec_dur / (npu_freq_MHz * 1e6)
+        self.dram_dynamic_power_W = (
+            self.energy_dram / 1e12 / exec_time_s if exec_time_s else 0.0
+        )
+        self.dram_base_dynamic_power_W = (
+            self.energy_dram_base / 1e12 / exec_time_s if exec_time_s else 0.0
+        )
+        self.dram_row_conflict_dynamic_power_W = (
+            self.energy_dram_row_conflict / 1e12 / exec_time_s
+            if exec_time_s else 0.0
+        )
         # self.energy_ssi         = energy[3]
         # self.energy_dram        = energy[4]
         self.dram_util          = self.get_dram_util_intensity(dram_bw_GBps, npu_freq_MHz)
@@ -508,12 +535,24 @@ class FusedOperatorExecLog:
             f"Shift={getattr(self, 'noc_shift_byte_hops', 0)}, "
             f"Reduce={getattr(self, 'noc_reduce_byte_hops', 0)}\n"
         )
+        dram_conflict_str = (
+            "DRAM row conflicts (ACT+PRE): "
+            f"Total={getattr(self, 'dram_row_conflicts', 0)}, "
+            f"Read={getattr(self, 'dram_r_row_conflicts', 0)}, "
+            f"Write={getattr(self, 'dram_w_row_conflicts', 0)}, "
+            f"Energy={getattr(self, 'energy_dram_row_conflict', 0.0)} pJ\n"
+            "DRAM dynamic power (W): "
+            f"Total={getattr(self, 'dram_dynamic_power_W', 0.0)}, "
+            f"Base={getattr(self, 'dram_base_dynamic_power_W', 0.0)}, "
+            f"RowConflict={getattr(self, 'dram_row_conflict_dynamic_power_W', 0.0)}\n"
+        )
         comp_util_str= f"Compute Utilization: {self.mm_util} VU Utilization: {self.vu_util}\n"
         power_str = f"Average Power (W): {self.power_W}\n"
         interval_str = ""
         # interval_str = (" ").join([str(ival) for ival in self.intervals])
         return (op_str + event_str + dur_str + interval_str + comp_util_str
-                + traffic_str + noc_traffic_hops_str + power_str)
+                + traffic_str + noc_traffic_hops_str + dram_conflict_str
+                + power_str)
 
     def __repr__(self):
         '''
