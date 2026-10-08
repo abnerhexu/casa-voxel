@@ -475,6 +475,7 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
     all_temporal_partitions = []
     all_partitions = []
     all_noc_cycles = []
+    all_noc_traffic_hops = []
     print("Gathering op data...")
     op_data_start = time.time()
     for i in range(len(unfused_ops)):
@@ -491,15 +492,17 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
                                             output_special_format_for_tsim=True)
 
         tensor_sizes = op.expr.get_sub_op_var_sizes(temporal, spatial)
-        noc_cycles = noc.get_total_cycles_from_expression(tensor_sizes,
-                                                          temporal_var_replicas,
-                                                          spatial_var_replicas,
-                                                          shift_info,
-                                                          num_bytes_per_elem=op.num_byte_per_elem,
-                                                          spmd_compiler=spmd_compiler,
-                                                          seq_noc=seq_noc,
-                                                          )
+        noc_cycles, noc_traffic_hops = noc.get_total_cycles_and_traffic_hops_from_expression(
+            tensor_sizes,
+            temporal_var_replicas,
+            spatial_var_replicas,
+            shift_info,
+            num_bytes_per_elem=op.num_byte_per_elem,
+            spmd_compiler=spmd_compiler,
+            seq_noc=seq_noc,
+        )
         all_noc_cycles.append(noc_cycles)
+        all_noc_traffic_hops.append(noc_traffic_hops)
     print("Gathering op data took", time.time() - op_data_start, "seconds")
     fuse_start = time.time()
     print("Fusing ops...")
@@ -526,6 +529,25 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
                                                         noc_data=all_noc_cycles,
                                                         dram_bw_GBps=dram_bandwidth_GBps,
                                                         npu_freq_MHz=npu_freq_MHz)
+    # Hop-weighted traffic is additive, so retain both the per-operator
+    # breakdown and the workload-wide totals.  FusedOperatorExecLog remains
+    # backward-compatible: these fields are attached after construction and
+    # old pickles can be read with getattr(..., 0).
+    for op_log, traffic_hops in zip(fused_op_logs, all_noc_traffic_hops):
+        bcast_byte_hops, shift_byte_hops, reduce_byte_hops = traffic_hops
+        op_log.noc_bcast_byte_hops = bcast_byte_hops
+        op_log.noc_shift_byte_hops = shift_byte_hops
+        op_log.noc_reduce_byte_hops = reduce_byte_hops
+        op_log.noc_byte_hops = sum(traffic_hops)
+
+    stats["noc_bcast_byte_hops"] = math.fsum(v[0] for v in all_noc_traffic_hops)
+    stats["noc_shift_byte_hops"] = math.fsum(v[1] for v in all_noc_traffic_hops)
+    stats["noc_reduce_byte_hops"] = math.fsum(v[2] for v in all_noc_traffic_hops)
+    stats["noc_byte_hops"] = (
+        stats["noc_bcast_byte_hops"]
+        + stats["noc_shift_byte_hops"]
+        + stats["noc_reduce_byte_hops"]
+    )
     per_comp_sum =  (stats["sa_energy"] + stats["vu_energy"] + stats["noc_energy"] + stats["dram_energy"] + stats["sram_energy"] + stats["tsv_energy"])
     assert math.isclose(stats["exec_energy"], per_comp_sum, rel_tol=1e-5), \
         f"Energy breakdown does not sum to total energy! total: {stats['exec_energy']} vs {per_comp_sum}"
@@ -572,6 +594,10 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         stats["vu_energy"] = int(stats["vu_energy"] * tot_layers / sim_layers)
         stats["sram_energy"] = int(stats["sram_energy"] * tot_layers / sim_layers)
         stats["noc_energy"] = int(stats["noc_energy"] * tot_layers / sim_layers)
+        stats["noc_bcast_byte_hops"] *= tot_layers / sim_layers
+        stats["noc_shift_byte_hops"] *= tot_layers / sim_layers
+        stats["noc_reduce_byte_hops"] *= tot_layers / sim_layers
+        stats["noc_byte_hops"] *= tot_layers / sim_layers
         stats["dram_energy"] = int(stats["dram_energy"] * tot_layers / sim_layers)
         stats["tsv_energy"] = int(stats["tsv_energy"] * tot_layers / sim_layers)
 
@@ -741,7 +767,8 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
                   uniform_dram_mapping=False,
                   spmd_compiler=False, seq_noc=False,
                   ipu_tsim=False,
-                  dataflow=False):
+                  dataflow=False,
+                  noc_traffic_hops: List[Tuple[float, float, float]] = None):
     """Post-process simulation results: select best configuration, log stats, and generate plots.
 
     For each hardware configuration in the input lists this function:
@@ -781,12 +808,17 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
         spmd_compiler: Flag indicating naive-compiler baseline.
         seq_noc: Flag indicating degraded-NoC baseline.
         ipu_tsim: Flag for IPU-style synthetic comparison mode.
+        noc_traffic_hops: Optional per-configuration tuples of
+            ``(broadcast, shift, reduce)`` traffic in byte-hops.
     """
     import matplotlib.pyplot as plt
 
     print(f"PARSING RESULTS {out_dir=}")
     assert(len(exec_times) == len(fused_op_logs) == len(hw_cfg_info) == len(exec_energy)
            ==len(dram_utils) == len(overlap_lists)), "Each run should have all stats!"
+    if noc_traffic_hops is not None:
+        assert len(noc_traffic_hops) == len(exec_times), \
+            "Each run should have one NoC byte-hop tuple"
     best_exec = -1
     best_exec_idx = -1
     #Find best config:
@@ -911,6 +943,14 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
         log_str += f"Power (w): {dyn_power_W + static_power_W}, Static: {static_power_W} W (dram: {dram_static_power_W} logic: {logic_static_power_W}), Dyn.: {dyn_power_W} W\n"
         log_str += f"Overall Util: {overall_util}\n"
         log_str += f"DRAM UTIL (%): {dram_util[0] * 100}/{dram_util[1] * 100} (R/W), SA_UTIL:{sa_util}, VU_UTIL:{vu_util}, NOC: {noc_util}\n"
+        if noc_traffic_hops is not None:
+            bcast_bh, shift_bh, reduce_bh = noc_traffic_hops[i]
+            total_bh = bcast_bh + shift_bh + reduce_bh
+            log_str += (
+                "NoC traffic x hops (byte-hop): "
+                f"Total={total_bh}, Broadcast={bcast_bh}, "
+                f"Shift={shift_bh}, Reduce={reduce_bh}\n"
+            )
         log_str += f"FLOPS: {hw_cfg_info[i].num_cores * sa_flop_per_core / (1024 ** 3)} GFLOPS MM, "
         log_str += f"{hw_cfg_info[i].num_cores * vu_flop_per_core / (1024 ** 3)} GFLOPS VU\n"
         for l_idx, log in enumerate(fused_op_log):

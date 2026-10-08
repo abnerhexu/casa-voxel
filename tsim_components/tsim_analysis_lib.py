@@ -501,11 +501,19 @@ class FusedOperatorExecLog:
         event_str = f"START TIMES:  Ld: {self.t_dram_ld_start} -> broadcast {self.t_bcast_start} -> comp/sh {self.t_comp_shift_start} -> reduce {self.t_reduce_start}{dram_w_string} -> fin {self.t_finish}\n"
         dur_str = f"DURATIONS:    Ld: {self.dram_ld_dur} -> broadcast {self.bcast_dur} -> comp/sh {self.comp_sh_dur}/{self.shift_dur} -> reduce {self.reduce_dur}{dram_w_string_dur}\n"
         traffic_str = f"Write bytes: {self.dram_w_bytes} Read bytes: {self.dram_r_bytes}\n"
+        noc_traffic_hops_str = (
+            "NoC traffic x hops (byte-hop): "
+            f"Total={getattr(self, 'noc_byte_hops', 0)}, "
+            f"Broadcast={getattr(self, 'noc_bcast_byte_hops', 0)}, "
+            f"Shift={getattr(self, 'noc_shift_byte_hops', 0)}, "
+            f"Reduce={getattr(self, 'noc_reduce_byte_hops', 0)}\n"
+        )
         comp_util_str= f"Compute Utilization: {self.mm_util} VU Utilization: {self.vu_util}\n"
         power_str = f"Average Power (W): {self.power_W}\n"
         interval_str = ""
         # interval_str = (" ").join([str(ival) for ival in self.intervals])
-        return (op_str + event_str + dur_str + interval_str + comp_util_str + traffic_str + power_str)
+        return (op_str + event_str + dur_str + interval_str + comp_util_str
+                + traffic_str + noc_traffic_hops_str + power_str)
 
     def __repr__(self):
         '''

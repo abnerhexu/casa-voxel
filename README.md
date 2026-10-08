@@ -200,6 +200,21 @@ find results/logs/ -name "output_*.log" | wc -l
 bash run_figure_data.sh --dry-run
 ```
 
+Every newly generated `output_*.log` also reports hop-weighted NoC traffic:
+
+```text
+NoC traffic x hops (byte-hop): Total=..., Broadcast=..., Shift=..., Reduce=...
+```
+
+The total is the workload sum of bytes crossing NoC links, with one byte sent
+over one hop counted as one byte-hop. It is computed from the final selected
+spatial/temporal tiling, using the same approximate dimension-to-topology
+mapping as the default NoC latency model. Per-operator values are printed in
+the detailed log and stored on each pickled `FusedOperatorExecLog` as
+`noc_byte_hops`, `noc_bcast_byte_hops`, `noc_shift_byte_hops`, and
+`noc_reduce_byte_hops`; direct `run_tsim()` callers receive the corresponding
+aggregate keys in `stats`.
+
 ### 3.4 Generate Figures (Figs 10–20)
 
 Once simulation data is ready (verify with the dry-run in Section 3.3), each

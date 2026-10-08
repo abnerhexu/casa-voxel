@@ -428,13 +428,58 @@ class NoC:
             Tuple[int, int, int]: ``(broadcast_cycles, shift_cycles,
             reduce_cycles)``.
         """
-        all_broadcast_cycles, shift_cycles, reduce_cycles = self.get_approx_cycles_from_expression(tensor_sizes, temporal_var_replicas, spatial_var_replicas, shift_info, num_bytes_per_elem, bad_mapping=seq_noc)
+        cycles, _ = self.get_total_cycles_and_traffic_hops_from_expression(
+            tensor_sizes,
+            temporal_var_replicas,
+            spatial_var_replicas,
+            shift_info,
+            num_bytes_per_elem=num_bytes_per_elem,
+            spmd_compiler=spmd_compiler,
+            seq_noc=seq_noc,
+        )
+        return cycles
 
+    def get_total_cycles_and_traffic_hops_from_expression(
+            self,
+            tensor_sizes: List[int],
+            temporal_var_replicas: List[int],
+            spatial_var_replicas: List[int],
+            shift_info: tuple,
+            num_bytes_per_elem: int = 2,
+            spmd_compiler: bool = False,
+            seq_noc: bool = False,
+            ) -> Tuple[Tuple[int, int, int], Tuple[float, float, float]]:
+        """Return NoC cycles and hop-weighted byte traffic for one operator.
+
+        The second tuple is ``(broadcast, shift, reduce)`` in byte-hops, where
+        one byte traversing one physical/logical NoC link contributes one
+        byte-hop.  It is derived from the same approximate dimension mapping
+        and hop counts used by the default latency model, before bandwidth,
+        startup-latency, torus-duplex, or contention transformations are
+        applied.  Consequently this metric is additive across transfers and
+        operators, unlike NoC latency.
+
+        ``spmd_compiler`` only changes phase scheduling: shift latency is
+        charged to broadcast/reduce by the existing model, but the underlying
+        traffic remains classified as shift traffic and is not double-counted.
+        """
+        cycles, traffic_hops = self.get_approx_cycles_from_expression(
+            tensor_sizes,
+            temporal_var_replicas,
+            spatial_var_replicas,
+            shift_info,
+            num_bytes_per_elem,
+            bad_mapping=seq_noc,
+            return_traffic_hops=True,
+        )
+        broadcast_cycles, shift_cycles, reduce_cycles = cycles
         if spmd_compiler:
-            # Shift cost cannot be hidden: add it to both broadcast and reduce.
-            return all_broadcast_cycles+shift_cycles, 0, reduce_cycles+shift_cycles
-        else:
-            return all_broadcast_cycles, shift_cycles, reduce_cycles
+            cycles = (
+                broadcast_cycles + shift_cycles,
+                0,
+                reduce_cycles + shift_cycles,
+            )
+        return cycles, traffic_hops
 
     def get_exact_cycles_from_expression(self,
                                          tensor_sizes: List[int],
@@ -589,7 +634,8 @@ class NoC:
                                          spatial_var_replicas: List[int],
                                          shift_info: tuple,
                                          num_bytes_per_elem: int = 2,
-                                         bad_mapping: bool = False) -> Tuple[int, int, int]:
+                                         bad_mapping: bool = False,
+                                         return_traffic_hops: bool = False):
         """Approximate cycle estimation using a greedy dimension-mapping heuristic.
 
         Instead of constructing explicit paths, this method models the NoC as
@@ -660,8 +706,15 @@ class NoC:
                                                 reduce_broadcast_num_transfers_list[0],
                                                 num_bytes_per_elem,
                                                 reduce_broadcast_num_hops_list[0])
+        reduce_byte_hops = (
+            reduce_broadcast_num_elems_list[0]
+            * reduce_broadcast_num_transfers_list[0]
+            * num_bytes_per_elem
+            * reduce_broadcast_num_hops_list[0]
+        )
         # Indices 1.. are input tensors -> broadcast traffic.
         all_broadcast_cycles = 0
+        broadcast_byte_hops = 0.0
         for num_elems, num_transfers, num_hops in zip(reduce_broadcast_num_elems_list[1:],
                                                     reduce_broadcast_num_transfers_list[1:],
                                                     reduce_broadcast_num_hops_list[1:]):
@@ -670,9 +723,13 @@ class NoC:
                                                             num_bytes_per_elem,
                                                             num_hops,
                                                             use_sram=self.use_sram)
+            broadcast_byte_hops += (
+                num_elems * num_transfers * num_bytes_per_elem * num_hops
+            )
         
         total_shift_size, shifted_dim, shifted_iter, shifted_vars, list_of_list_of_size_iter = shift_info
         shift_cycles = 0
+        shift_byte_hops = 0.0
         if total_shift_size != 0:
             for list_of_size_iter in list_of_list_of_size_iter:
                 max_shift_cycles = 0
@@ -688,13 +745,24 @@ class NoC:
                                                                 num_bytes_per_elem,
                                                                 num_hops,
                                                                 is_shift=True)
+                    shift_byte_hops += (
+                        size * num_shifts * num_iters
+                        * num_bytes_per_elem * num_hops
+                    )
                     if self.is_spatial:
                         max_shift_cycles = max(max_shift_cycles, cur_shift_cycles)
                     else:
                         max_shift_cycles += cur_shift_cycles
                 shift_cycles += max_shift_cycles
 
-        return int(all_broadcast_cycles), int(shift_cycles), int(reduce_cycles)
+        cycles = (int(all_broadcast_cycles), int(shift_cycles), int(reduce_cycles))
+        if return_traffic_hops:
+            return cycles, (
+                float(broadcast_byte_hops),
+                float(shift_byte_hops),
+                float(reduce_byte_hops),
+            )
+        return cycles
 
 if __name__ == "__main__":
     # Quick smoke test: 10-node 3-D torus with a simple two-tensor workload.
@@ -722,4 +790,3 @@ if __name__ == "__main__":
         tensor_sizes, temporal_var_replicas, spatial_var_replicas,
         shift_info, num_bytes_per_elem=2,
     )
-

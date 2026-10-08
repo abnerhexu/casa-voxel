@@ -9,7 +9,7 @@ import re
 from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Summary (first 9 lines of output_cg_*.log)
+# Summary (header block of output_cg_*.log)
 # ---------------------------------------------------------------------------
 
 def parse_summary_text(content: str) -> Dict:
@@ -82,14 +82,29 @@ def parse_summary_text(content: str) -> Dict:
             if v is not None:
                 summary[key] = v
 
-    if len(lines) > 8:
-        fl = lines[8]
+    fl = next((line for line in lines[:16] if line.startswith("FLOPS:")), "")
+    if fl:
         v = _f(r"FLOPS: ([\d.eE+-]+) GFLOPS MM", fl)
         if v is not None:
             summary["mm_gflops"] = v
         v = _f(r"([\d.eE+-]+) GFLOPS VU", fl)
         if v is not None:
             summary["vu_gflops"] = v
+
+    noc_bh_line = next(
+        (line for line in lines[:16] if line.startswith("NoC traffic x hops")),
+        "",
+    )
+    if noc_bh_line:
+        for key, pat in (
+            ("noc_byte_hops", r"Total=([\d.eE+-]+)"),
+            ("noc_bcast_byte_hops", r"Broadcast=([\d.eE+-]+)"),
+            ("noc_shift_byte_hops", r"Shift=([\d.eE+-]+)"),
+            ("noc_reduce_byte_hops", r"Reduce=([\d.eE+-]+)"),
+        ):
+            value = _f(pat, noc_bh_line)
+            if value is not None:
+                summary[key] = value
 
     return summary
 
@@ -120,6 +135,11 @@ _DUR_RE = re.compile(
 _UTIL_RE = re.compile(
     r"Compute Utilization:\s*([\d.eE+-]+)\s*VU Utilization:\s*([\d.eE+-]+)")
 _BYTES_RE = re.compile(r"Write bytes:\s*(\d+)\s*Read bytes:\s*(\d+)")
+_NOC_BYTE_HOPS_RE = re.compile(
+    r"NoC traffic x hops \(byte-hop\):\s*"
+    r"Total=([\d.eE+-]+),\s*Broadcast=([\d.eE+-]+),\s*"
+    r"Shift=([\d.eE+-]+),\s*Reduce=([\d.eE+-]+)"
+)
 _POWER_RE = re.compile(r"Average Power \(W\):\s*([\d.eE+-]+)")
 
 
@@ -137,7 +157,17 @@ def parse_operators_text(content: str) -> List[Dict]:
         dur_m = _DUR_RE.search(lines[i + 2])
         util_m = _UTIL_RE.search(lines[i + 3])
         bytes_m = _BYTES_RE.search(lines[i + 4])
-        power_m = (_POWER_RE.search(lines[i + 5]) if i + 5 < n else None)
+        trailing_lines = lines[i + 5:min(i + 8, n)]
+        noc_byte_hops_m = next(
+            (_NOC_BYTE_HOPS_RE.search(candidate) for candidate in trailing_lines
+             if _NOC_BYTE_HOPS_RE.search(candidate)),
+            None,
+        )
+        power_m = next(
+            (_POWER_RE.search(candidate) for candidate in trailing_lines
+             if _POWER_RE.search(candidate)),
+            None,
+        )
         if not (start_m and dur_m and util_m and bytes_m):
             continue
         operators.append({
@@ -159,6 +189,10 @@ def parse_operators_text(content: str) -> List[Dict]:
             "vu_util": float(util_m.group(2)),
             "write_bytes": int(bytes_m.group(1)),
             "read_bytes": int(bytes_m.group(2)),
+            "noc_byte_hops": float(noc_byte_hops_m.group(1)) if noc_byte_hops_m else 0.0,
+            "noc_bcast_byte_hops": float(noc_byte_hops_m.group(2)) if noc_byte_hops_m else 0.0,
+            "noc_shift_byte_hops": float(noc_byte_hops_m.group(3)) if noc_byte_hops_m else 0.0,
+            "noc_reduce_byte_hops": float(noc_byte_hops_m.group(4)) if noc_byte_hops_m else 0.0,
             "avg_power_w": float(power_m.group(1)) if power_m else 0.0,
         })
     return operators

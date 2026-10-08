@@ -118,6 +118,10 @@ SUMMARY_METRICS = {
     "sa_util":           ("SA Util", "", "higher"),
     "vu_util":           ("VU Util", "", "higher"),
     "noc_util":          ("NoC Util", "", "higher"),
+    "noc_byte_hops":     ("NoC Traffic × Hops", "byte-hop", "lower"),
+    "noc_bcast_byte_hops": ("NoC Broadcast × Hops", "byte-hop", "lower"),
+    "noc_shift_byte_hops": ("NoC Shift × Hops", "byte-hop", "lower"),
+    "noc_reduce_byte_hops": ("NoC Reduce × Hops", "byte-hop", "lower"),
     "mm_gflops":         ("MM Throughput", "GFLOPS", "higher"),
     "vu_gflops":         ("VU Throughput", "GFLOPS", "higher"),
 }
