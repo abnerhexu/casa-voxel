@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
+import numpy as np
+
 from tsim_components.dram_placement import (
     allocation_bytes,
     build_placement_plan,
@@ -19,6 +21,14 @@ from tsim_components.dram_placement import (
     record_bytes,
     requester_core_weights,
     record_signature,
+)
+from tsim_components.noc import (
+    ALL_INIT_CYCLES,
+    CUSTOM_INIT_CYCLES,
+    MESH_INIT_CYCLES,
+    NOC_ROUTER_PIPELINE_CYCLES_PER_HOP,
+    TORUS_INIT_CYCLES,
+    Topo,
 )
 
 
@@ -37,18 +47,30 @@ class DRAMRowRun:
 @dataclass
 class DRAMStageStats:
     cycles: int = 0
+    dram_cycles: int = 0
+    noc_cycles: int = 0
     num_bytes: int = 0
     row_hits: int = 0
     row_misses: int = 0
     row_conflicts: int = 0
+    noc_byte_hops: float = 0.0
+    noc_max_link_bytes: float = 0.0
+    noc_max_hops: int = 0
+    noc_flow_count: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return {
             "cycles": int(self.cycles),
+            "dram_cycles": int(self.dram_cycles),
+            "noc_cycles": int(self.noc_cycles),
             "bytes": int(self.num_bytes),
             "row_hits": int(self.row_hits),
             "row_misses": int(self.row_misses),
             "row_conflicts": int(self.row_conflicts),
+            "noc_byte_hops": float(self.noc_byte_hops),
+            "noc_max_link_bytes": float(self.noc_max_link_bytes),
+            "noc_max_hops": int(self.noc_max_hops),
+            "noc_flow_count": int(self.noc_flow_count),
         }
 
 
@@ -57,6 +79,208 @@ class DRAMScheduleResult:
     read: DRAMStageStats
     write: DRAMStageStats
     records: List[dict]
+
+
+def _noc_stage_startup_cycles(noc) -> int:
+    configured = getattr(noc, "dram_noc_startup_cycles", None)
+    if configured is not None:
+        return int(configured)
+    if noc.topology in (Topo.MESH, Topo.MESH3D):
+        return int(MESH_INIT_CYCLES)
+    if noc.topology in (Topo.TORUS, Topo.TORUS3D):
+        return int(TORUS_INIT_CYCLES)
+    if noc.topology == Topo.ALL:
+        return int(ALL_INIT_CYCLES)
+    return int(CUSTOM_INIT_CYCLES)
+
+
+def _directed_noc_links(noc) -> Tuple[Tuple[int, int], ...]:
+    cached = getattr(noc, "_dram_noc_directed_links", None)
+    if cached is not None:
+        return cached
+    links = tuple(
+        (int(source), int(destination))
+        for source, row in enumerate(noc.interconnect_graph)
+        for destination, connected in enumerate(row)
+        if source != destination and connected
+    )
+    noc._dram_noc_directed_links = links
+    return links
+
+
+def _dram_noc_route_profiles(noc, channel_nodes, demand, stage):
+    """Return cached channel-by-link traffic fractions for one demand shape."""
+    total_demand = sum(weight for _core, weight in demand)
+    demand_key = tuple(
+        (int(core), round(float(weight) / total_demand, 15))
+        for core, weight in demand
+    )
+    cache = getattr(noc, "_dram_noc_route_profile_cache", None)
+    if cache is None:
+        cache = {}
+        noc._dram_noc_route_profile_cache = cache
+    key = (tuple(int(node) for node in channel_nodes), demand_key, str(stage))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    links = _directed_noc_links(noc)
+    link_index = {link: index for index, link in enumerate(links)}
+    profiles = np.zeros((len(channel_nodes), len(links)), dtype=np.float64)
+    average_hops = np.zeros(len(channel_nodes), dtype=np.float64)
+    max_hops = np.zeros(len(channel_nodes), dtype=np.int64)
+    for channel, endpoint in enumerate(channel_nodes):
+        for (core, _weight), (_key_core, fraction) in zip(demand, demand_key):
+            source, destination = (
+                (int(endpoint), int(core))
+                if stage == "read" else (int(core), int(endpoint))
+            )
+            path = noc.get_dimension_ordered_path(source, destination)
+            hops = max(0, len(path) - 1)
+            average_hops[channel] += fraction * hops
+            max_hops[channel] = max(max_hops[channel], hops)
+            for u, v in zip(path, path[1:]):
+                profiles[channel, link_index[(int(u), int(v))]] += fraction
+    cached = (profiles, average_hops, max_hops, links)
+    # A sweep normally reuses only a small set of requester shapes, but cap
+    # this potentially large channel-by-link matrix cache for adversarial or
+    # imported traces with one unique demand vector per tensor.
+    if len(cache) >= 128:
+        cache.pop(next(iter(cache)))
+    cache[key] = cached
+    return cached
+
+
+def _attach_dram_noc_stats(
+    *,
+    stats: DRAMStageStats,
+    stage: str,
+    runs: Sequence[DRAMRowRun],
+    records: List[MutableMapping[str, object]],
+    noc,
+    num_channels: int,
+) -> None:
+    """Account for channel-to-requester traffic without packet expansion.
+
+    Each record's bytes are first aggregated by the channels selected by its
+    physical banks. Requester demand then partitions each channel's bytes.
+    Dimension-ordered paths produce both byte-hops and directed-link loads;
+    the most heavily loaded link determines payload latency.
+    """
+    stats.dram_cycles = int(stats.cycles)
+    if noc is None or not runs or stats.num_bytes <= 0:
+        return
+    if not getattr(noc, "exact_topo", False):
+        raise ValueError("DRAM-to-core NoC accounting requires an exact topology")
+
+    channel_nodes = channel_injection_nodes(num_channels, int(noc.num_cores))
+    per_record_channels: Dict[int, Dict[int, float]] = {}
+    for run in runs:
+        weights = per_record_channels.setdefault(run.record_index, {})
+        weights[run.channel_id] = (
+            weights.get(run.channel_id, 0.0) + float(run.num_bytes)
+        )
+
+    directed_links = _directed_noc_links(noc)
+    stage_link_loads = np.zeros(len(directed_links), dtype=np.float64)
+    stage_byte_hops = 0.0
+    stage_max_hops = 0
+    stage_flow_count = 0
+    for record_index, channel_weights in per_record_channels.items():
+        record = records[record_index]
+        total_channel_bytes = sum(channel_weights.values())
+        expected_record_bytes = float(record_bytes(record))
+        if abs(total_channel_bytes - expected_record_bytes) > max(
+            1e-6, expected_record_bytes * 1e-12
+        ):
+            raise AssertionError(
+                "DRAM channel byte accounting is not conservative: "
+                f"scheduled={total_channel_bytes}, "
+                f"record={expected_record_bytes}"
+            )
+        demand = requester_core_weights(record)
+        if not demand:
+            # Backward-compatible fallback for imported/legacy records. New
+            # TSim records always carry explicit requester weights.
+            demand = ((0, total_channel_bytes),)
+        total_demand = sum(weight for _core, weight in demand)
+        if total_demand <= 0:
+            continue
+
+        profiles, average_hops, channel_max_hops, profile_links = (
+            _dram_noc_route_profiles(
+                noc, channel_nodes, demand, stage
+            )
+        )
+        if profile_links != directed_links:
+            raise AssertionError("cached DRAM NoC link ordering changed")
+        channel_vector = np.zeros(num_channels, dtype=np.float64)
+        for channel, channel_bytes in channel_weights.items():
+            channel_vector[channel] = float(channel_bytes)
+        record_link_loads = channel_vector @ profiles
+        stage_link_loads += record_link_loads
+        record_byte_hops = float(channel_vector @ average_hops)
+        active_channels = np.flatnonzero(channel_vector)
+        record_max_hops = int(
+            max((channel_max_hops[channel] for channel in active_channels), default=0)
+        )
+        record_flow_count = int(len(active_channels) * len(demand))
+        record_max_link = float(np.max(record_link_loads, initial=0.0))
+        record_noc_cycles = 0
+        if record_max_link > 0:
+            record_noc_cycles = (
+                _noc_stage_startup_cycles(noc)
+                + int(ceil(record_max_link / float(noc.bandwidth_bytepc)))
+                + record_max_hops * int(getattr(
+                    noc,
+                    "router_pipeline_cycles_per_hop",
+                    NOC_ROUTER_PIPELINE_CYCLES_PER_HOP,
+                ))
+            )
+        record["dram_noc_channel_ids"] = [
+            int(channel) for channel in sorted(channel_weights)
+        ]
+        record["channel_noc_nodes"] = [
+            int(channel_nodes[channel]) for channel in sorted(channel_weights)
+        ]
+        record["dram_noc_byte_hops"] = float(record_byte_hops)
+        record["dram_noc_max_hops"] = int(record_max_hops)
+        record["dram_noc_max_link_bytes"] = float(record_max_link)
+        record["dram_noc_cycles"] = int(record_noc_cycles)
+        record["scheduled_cycles"] = max(
+            int(record.get("scheduled_cycles", 0)), int(record_noc_cycles)
+        )
+        stage_byte_hops += record_byte_hops
+        stage_max_hops = max(stage_max_hops, record_max_hops)
+        stage_flow_count += record_flow_count
+
+    stats.noc_byte_hops = float(stage_byte_hops)
+    stats.noc_max_link_bytes = float(np.max(stage_link_loads, initial=0.0))
+    stats.noc_max_hops = int(stage_max_hops)
+    stats.noc_flow_count = int(stage_flow_count)
+    if stats.noc_max_link_bytes > 0:
+        stats.noc_cycles = (
+            _noc_stage_startup_cycles(noc)
+            + int(ceil(
+                stats.noc_max_link_bytes / float(noc.bandwidth_bytepc)
+            ))
+            + stats.noc_max_hops * int(getattr(
+                noc,
+                "router_pipeline_cycles_per_hop",
+                NOC_ROUTER_PIPELINE_CYCLES_PER_HOP,
+            ))
+        )
+    if abs(float(np.sum(stage_link_loads)) - stats.noc_byte_hops) > max(
+        1e-6, stats.noc_byte_hops * 1e-12
+    ):
+        raise AssertionError(
+            "DRAM NoC link loads do not conserve byte-hops: "
+            f"links={float(np.sum(stage_link_loads))}, "
+            f"byte_hops={stats.noc_byte_hops}"
+        )
+    # DRAM and the mesh stream independent 128-B transactions. Their payload
+    # phases therefore overlap and the slower resource determines completion.
+    stats.cycles = max(int(stats.dram_cycles), int(stats.noc_cycles))
 
 
 class DRAMExecutionSession:
@@ -372,14 +596,6 @@ class DRAMExecutionSession:
                 "address": int(self._tensor_addresses[signature]),
                 "allocation_bytes": int(allocation_bytes(record)),
             })
-            if self.placement_policy == "noc_aware":
-                nodes = channel_injection_nodes(
-                    int(self.dram.geometry.num_channels),
-                    int(self.noc.num_cores),
-                )
-                record["channel_noc_nodes"] = [
-                    nodes[channel] for channel in placement.channel_ids
-                ]
 
         read_runs = [
             run for run in runs
@@ -391,4 +607,20 @@ class DRAMExecutionSession:
         ]
         read = self._schedule_stage(read_runs, records)
         write = self._schedule_stage(write_runs, records)
+        _attach_dram_noc_stats(
+            stats=read,
+            stage="read",
+            runs=read_runs,
+            records=records,
+            noc=self.noc,
+            num_channels=int(self.dram.geometry.num_channels),
+        )
+        _attach_dram_noc_stats(
+            stats=write,
+            stage="write",
+            runs=write_runs,
+            records=records,
+            noc=self.noc,
+            num_channels=int(self.dram.geometry.num_channels),
+        )
         return DRAMScheduleResult(read=read, write=write, records=records)

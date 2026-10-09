@@ -45,6 +45,12 @@ TORUS_INIT_CYCLES = 20
 ALL_INIT_CYCLES = 100
 CUSTOM_INIT_CYCLES = 50  # TODO: consider making this an input parameter
 
+# Default dynamic transport energy for the lightweight built-in model.  The
+# unit is deliberately per byte-hop: one byte crossing two links consumes
+# twice the transport energy of one byte crossing one link.
+NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP = 12.0
+NOC_ROUTER_PIPELINE_CYCLES_PER_HOP = 1
+
 class Topo(Enum):
     """Supported NoC topology types.
 
@@ -118,7 +124,10 @@ class NoC:
                  topology: Topo,
                  nodes: list,
                  interconnect_graph: list = None,
-                 use_sram: bool = False
+                 use_sram: bool = False,
+                 energy_pj_per_byte_hop: float = NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP,
+                 router_pipeline_cycles_per_hop: int = NOC_ROUTER_PIPELINE_CYCLES_PER_HOP,
+                 dram_noc_startup_cycles: Optional[int] = None,
                  ) -> None:
         """Initialise the NoC and build the adjacency matrix.
 
@@ -131,11 +140,32 @@ class NoC:
                 link exists between nodes *i* and *j*.
             use_sram: If True, broadcast transfers use a fixed SRAM bandwidth
                 (3.57 bytes/cycle) instead of ``bandwidth_bytepc``.
+            energy_pj_per_byte_hop: Dynamic transport energy coefficient.
+            router_pipeline_cycles_per_hop: Per-hop DRAM-route latency.
+            dram_noc_startup_cycles: Optional per-stage DRAM-NoC startup;
+                topology-specific defaults are used when omitted.
         """
         self.bandwidth_bytepc = bandwidth_bytepc
         self.topology = Topo(topology)
         self.use_sram = use_sram
         self.num_cores = len(nodes)
+        self.energy_pj_per_byte_hop = float(energy_pj_per_byte_hop)
+        self.router_pipeline_cycles_per_hop = int(
+            router_pipeline_cycles_per_hop
+        )
+        self.dram_noc_startup_cycles = (
+            None if dram_noc_startup_cycles is None
+            else int(dram_noc_startup_cycles)
+        )
+        if self.energy_pj_per_byte_hop < 0:
+            raise ValueError("NoC byte-hop energy must be non-negative")
+        if self.router_pipeline_cycles_per_hop < 0:
+            raise ValueError("NoC router pipeline latency must be non-negative")
+        if (
+            self.dram_noc_startup_cycles is not None
+            and self.dram_noc_startup_cycles < 0
+        ):
+            raise ValueError("DRAM-NoC startup latency must be non-negative")
 
         # Mesh and torus variants are "spatial" (multi-hop); all-to-all is not.
         self.is_spatial = self.topology in (
@@ -159,6 +189,7 @@ class NoC:
                 m = len(nodes) // a
                 break
             a -= 1
+        self.grid_shape = (int(n), int(m))
 
         # --- Build adjacency matrix per topology ---------------------------
         self.exact_topo = True
@@ -397,6 +428,38 @@ class NoC:
             path.append(v)
         path = path[::-1]
         return d, path
+
+    def get_dimension_ordered_path(self, source: int, destination: int) -> list:
+        """Return a deterministic X-then-Y path for a row-major 2-D mesh.
+
+        Other exact topologies fall back to their deterministic shortest path.
+        The L1 baseline uses ``Topo.MESH``, for which this makes DRAM-channel
+        traffic use the same dimension-ordered mapping assumption as tiling.
+        """
+        source = int(source)
+        destination = int(destination)
+        if not 0 <= source < self.num_cores:
+            raise ValueError(f"source core {source} is outside the NoC")
+        if not 0 <= destination < self.num_cores:
+            raise ValueError(
+                f"destination core {destination} is outside the NoC"
+            )
+        if source == destination:
+            return [source]
+        if self.topology != Topo.MESH:
+            return list(self.get_hops(source, destination)[1])
+
+        _rows, columns = self.grid_shape
+        row, column = divmod(source, columns)
+        dst_row, dst_column = divmod(destination, columns)
+        path = [source]
+        while column != dst_column:
+            column += 1 if dst_column > column else -1
+            path.append(row * columns + column)
+        while row != dst_row:
+            row += 1 if dst_row > row else -1
+            path.append(row * columns + column)
+        return path
 
     def get_total_cycles_from_expression(self,
                                          tensor_sizes: List[int],

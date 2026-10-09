@@ -34,7 +34,11 @@ from icbm_DNNProgram import *
 from tsim_components.mem import DRAM, NUM_BANKS, DEFAULT_TRCD, DEFAULT_TRP, get_per_cycle_bytes_per_core_from_DRAM_config
 from tsim_components.mem import get_sram_area_from_size, get_dram_area_from_size
 from tsim_components.comp_util import Compute_OP, Compute
-from tsim_components.noc import Topo, NoC
+from tsim_components.noc import (
+    NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP,
+    NoC,
+    Topo,
+)
 from tsim_components.tsim_analysis_lib import OverlapInterval, FusedOperatorExecLog, draw_overlap, draw_dram_intensity
 from tsim_components.experiment_output import (
     build_experiment_record,
@@ -576,15 +580,121 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         op_log.noc_bcast_byte_hops = bcast_byte_hops
         op_log.noc_shift_byte_hops = shift_byte_hops
         op_log.noc_reduce_byte_hops = reduce_byte_hops
-        op_log.noc_byte_hops = sum(traffic_hops)
+        op_log.operator_noc_byte_hops = sum(traffic_hops)
+        op_log.noc_byte_hops = (
+            op_log.operator_noc_byte_hops
+            + float(getattr(op_log, "dram_noc_byte_hops", 0.0))
+        )
+
+        # Replace the legacy volume-only NoC transport estimate. Adding this
+        # term on top would double-count movement; retain only the separately
+        # identified sync/control part of the legacy NoC energy.
+        op_log.energy_noc_legacy = float(getattr(op_log, "energy_noc", 0.0))
+        op_log.energy_sss_legacy = float(getattr(op_log, "energy_sss", 0.0))
+        noc_energy_pj_per_byte_hop = float(getattr(
+            noc,
+            "energy_pj_per_byte_hop",
+            NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP,
+        ))
+        op_log.noc_energy_pj_per_byte_hop = noc_energy_pj_per_byte_hop
+        op_log.energy_noc_operator = (
+            op_log.operator_noc_byte_hops
+            * noc_energy_pj_per_byte_hop
+        )
+        op_log.energy_noc_dram_transport = (
+            float(getattr(op_log, "dram_noc_byte_hops", 0.0))
+            * noc_energy_pj_per_byte_hop
+        )
+        op_log.energy_noc_control = float(
+            getattr(op_log, "energy_noc_control", 0.0)
+        )
+        new_noc_energy = (
+            op_log.energy_noc_control
+            + op_log.energy_noc_operator
+            + op_log.energy_noc_dram_transport
+        )
+        op_log.energy_total = float(getattr(op_log, "energy_total", 0.0))
+        op_log.energy_total += new_noc_energy - op_log.energy_noc_legacy
+        op_log.energy_noc = new_noc_energy
+        op_log.energy_sss = (
+            op_log.energy_sss_legacy
+            + op_log.energy_noc_control
+            + op_log.energy_noc_operator
+            - op_log.energy_noc_legacy
+        )
+        exec_time_s = float(getattr(op_log, "exec_dur", 0.0)) / (
+            npu_freq_MHz * 1e6
+        )
+        op_log.noc_dynamic_power_W = (
+            op_log.energy_noc / 1e12 / exec_time_s if exec_time_s else 0.0
+        )
+        op_log.power_W = (
+            op_log.energy_total / 1e12 / exec_time_s if exec_time_s else 0.0
+        )
 
     stats["noc_bcast_byte_hops"] = math.fsum(v[0] for v in all_noc_traffic_hops)
     stats["noc_shift_byte_hops"] = math.fsum(v[1] for v in all_noc_traffic_hops)
     stats["noc_reduce_byte_hops"] = math.fsum(v[2] for v in all_noc_traffic_hops)
-    stats["noc_byte_hops"] = (
+    stats["operator_noc_byte_hops"] = (
         stats["noc_bcast_byte_hops"]
         + stats["noc_shift_byte_hops"]
         + stats["noc_reduce_byte_hops"]
+    )
+    stats["dram_noc_read_byte_hops"] = math.fsum(
+        float(getattr(log, "dram_noc_read_byte_hops", 0.0))
+        for log in fused_op_logs
+    )
+    stats["dram_noc_write_byte_hops"] = math.fsum(
+        float(getattr(log, "dram_noc_write_byte_hops", 0.0))
+        for log in fused_op_logs
+    )
+    stats["dram_noc_byte_hops"] = (
+        stats["dram_noc_read_byte_hops"]
+        + stats["dram_noc_write_byte_hops"]
+    )
+    stats["noc_byte_hops"] = (
+        stats["operator_noc_byte_hops"] + stats["dram_noc_byte_hops"]
+    )
+    stats["dram_noc_read_cycles"] = sum(
+        int(getattr(log, "dram_noc_read_cycles", 0))
+        for log in fused_op_logs
+    )
+    stats["dram_noc_write_cycles"] = sum(
+        int(getattr(log, "dram_noc_write_cycles", 0))
+        for log in fused_op_logs
+    )
+    stats["noc_max_link_bytes"] = max(
+        (float(getattr(log, "dram_noc_max_link_bytes", 0.0))
+         for log in fused_op_logs),
+        default=0.0,
+    )
+    stats["noc_max_route_hops"] = max(
+        (int(getattr(log, "dram_noc_max_hops", 0))
+         for log in fused_op_logs),
+        default=0,
+    )
+    stats["noc_energy_legacy"] = float(stats.get("noc_energy", 0.0))
+    stats["noc_control_energy"] = math.fsum(
+        float(getattr(log, "energy_noc_control", 0.0))
+        for log in fused_op_logs
+    )
+    stats["noc_operator_energy"] = math.fsum(
+        float(getattr(log, "energy_noc_operator", 0.0))
+        for log in fused_op_logs
+    )
+    stats["noc_dram_transport_energy"] = math.fsum(
+        float(getattr(log, "energy_noc_dram_transport", 0.0))
+        for log in fused_op_logs
+    )
+    new_noc_energy = (
+        stats["noc_control_energy"]
+        + stats["noc_operator_energy"]
+        + stats["noc_dram_transport_energy"]
+    )
+    stats["exec_energy"] += new_noc_energy - stats["noc_energy"]
+    stats["noc_energy"] = new_noc_energy
+    stats["sss_energy"] = math.fsum(
+        float(getattr(log, "energy_sss", 0.0)) for log in fused_op_logs
     )
     # Preserve compatibility with custom/older DNNProgram implementations
     # that return the pre-row-conflict stats schema.
@@ -667,6 +777,9 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
             "dram_r_bytes", "dram_w_bytes", "exec_time", "comp_energy",
             "sss_energy", "exec_energy", "sa_energy", "vu_energy",
             "sram_energy", "noc_energy", "dram_energy", "dram_base_energy",
+            "noc_operator_energy", "noc_dram_transport_energy",
+            "noc_control_energy", "noc_energy_legacy", "dram_noc_read_cycles",
+            "dram_noc_write_cycles",
             "dram_row_conflict_energy", "dram_row_conflicts",
             "dram_r_row_conflicts", "dram_w_row_conflicts", "dram_row_hits",
             "dram_r_row_hits", "dram_w_row_hits", "dram_row_misses",
@@ -677,9 +790,24 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
             stats[key] = int(stats[key] * scale_factor)
         for key in (
             "noc_bcast_byte_hops", "noc_shift_byte_hops",
-            "noc_reduce_byte_hops", "noc_byte_hops",
+            "noc_reduce_byte_hops", "operator_noc_byte_hops",
+            "dram_noc_read_byte_hops", "dram_noc_write_byte_hops",
+            "dram_noc_byte_hops", "noc_byte_hops",
         ):
             stats[key] *= scale_factor
+    exec_time_s = stats["exec_time"] / (npu_freq_MHz * 1e6)
+    stats["noc_dynamic_power_w"] = (
+        stats["noc_energy"] / 1e12 / exec_time_s if exec_time_s > 0 else 0.0
+    )
+    # Stable flat aliases for data-analysis scripts. Existing field names are
+    # retained for backward compatibility with earlier VOXEL outputs.
+    stats["total_noc_byte_hops"] = stats["noc_byte_hops"]
+    stats["noc_operator_dynamic_energy_pj"] = stats["noc_operator_energy"]
+    stats["noc_dram_transport_dynamic_energy_pj"] = (
+        stats["noc_dram_transport_energy"]
+    )
+    stats["noc_control_dynamic_energy_pj"] = stats["noc_control_energy"]
+    stats["noc_total_dynamic_energy_pj"] = stats["noc_energy"]
     placement_policy = (
         "uniform" if getattr(prog, "uniform_dram_mapping", False)
         else getattr(prog, "dram_placement_policy", "software_aware")
@@ -1113,11 +1241,32 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
         log_str += f"DRAM UTIL (%): {dram_util[0] * 100}/{dram_util[1] * 100} (R/W), SA_UTIL:{sa_util}, VU_UTIL:{vu_util}, NOC: {noc_util}\n"
         if noc_traffic_hops is not None:
             bcast_bh, shift_bh, reduce_bh = noc_traffic_hops[i]
-            total_bh = bcast_bh + shift_bh + reduce_bh
+            operator_bh = bcast_bh + shift_bh + reduce_bh
+            dram_read_bh = 0.0
+            dram_write_bh = 0.0
+            total_bh = operator_bh
+            if experiment_records is not None:
+                noc_metrics = experiment_records[i]["metrics"]["noc_byte_hops"]
+                dram_read_bh = float(noc_metrics.get("dram_read", 0.0))
+                dram_write_bh = float(noc_metrics.get("dram_write", 0.0))
+                total_bh = float(noc_metrics.get("total", operator_bh))
             log_str += (
                 "NoC traffic x hops (byte-hop): "
                 f"Total={total_bh}, Broadcast={bcast_bh}, "
-                f"Shift={shift_bh}, Reduce={reduce_bh}\n"
+                f"Shift={shift_bh}, Reduce={reduce_bh}, "
+                f"DRAMRead={dram_read_bh}, DRAMWrite={dram_write_bh}\n"
+            )
+        if experiment_records is not None:
+            noc_energy_metrics = experiment_records[i]["metrics"][
+                "noc_dynamic_energy_pj"
+            ]
+            log_str += (
+                "NoC dynamic energy (hop-aware): "
+                f"Control={noc_energy_metrics['control']} pJ, "
+                f"Operator={noc_energy_metrics['operator_transport']} pJ, "
+                f"DRAMTransport={noc_energy_metrics['dram_transport']} pJ, "
+                f"Total={noc_energy_metrics['total']} pJ, "
+                f"Power={noc_energy_metrics['average_power_w']} W\n"
             )
         log_str += f"FLOPS: {hw_cfg_info[i].num_cores * sa_flop_per_core / (1024 ** 3)} GFLOPS MM, "
         log_str += f"{hw_cfg_info[i].num_cores * vu_flop_per_core / (1024 ** 3)} GFLOPS VU\n"

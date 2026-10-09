@@ -41,7 +41,12 @@ from t10_utils import IPU_Mk2_cycle_to_ms
 from tsim_components.mem import DRAM, get_per_cycle_bytes_per_core_from_DRAM_config
 from tsim_components.dram_placement import SUPPORTED_DRAM_PLACEMENTS
 from tsim_components.comp_util import Compute_OP, Compute
-from tsim_components.noc import Topo, NoC
+from tsim_components.noc import (
+    NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP,
+    NOC_ROUTER_PIPELINE_CYCLES_PER_HOP,
+    NoC,
+    Topo,
+)
 from tsim_simple import run_tsim_helper, _init_worker, parse_results
 
 # Maximum edit distance allowed when pruning the operator execution-order
@@ -221,7 +226,18 @@ def get_hw_modules( hw_config, num_cores,
     noc = NoC(bandwidth_bytepc=noc_info["bandwidth_bytepc"],
               topology=noc_info["topology"],
               nodes=nodes,
-              use_sram=use_sram)
+              use_sram=use_sram,
+              energy_pj_per_byte_hop=noc_info.get(
+                  "energy_pj_per_byte_hop",
+                  NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP,
+              ),
+              router_pipeline_cycles_per_hop=noc_info.get(
+                  "router_pipeline_cycles_per_hop",
+                  NOC_ROUTER_PIPELINE_CYCLES_PER_HOP,
+              ),
+              dram_noc_startup_cycles=noc_info.get(
+                  "dram_noc_startup_cycles"
+              ))
 
     return dram, noc, comp, comp_op
 

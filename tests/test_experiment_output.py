@@ -53,7 +53,20 @@ class ExperimentOutputTest(unittest.TestCase):
             "noc_bcast_byte_hops": 10,
             "noc_shift_byte_hops": 20,
             "noc_reduce_byte_hops": 30,
-            "noc_byte_hops": 60,
+            "operator_noc_byte_hops": 60,
+            "dram_noc_read_byte_hops": 40,
+            "dram_noc_write_byte_hops": 20,
+            "dram_noc_byte_hops": 60,
+            "noc_byte_hops": 120,
+            "noc_operator_energy": 720,
+            "noc_dram_transport_energy": 720,
+            "noc_control_energy": 24,
+            "noc_energy": 1464,
+            "noc_dynamic_power_w": 0.001464,
+            "dram_noc_read_cycles": 11,
+            "dram_noc_write_cycles": 7,
+            "noc_max_link_bytes": 512,
+            "noc_max_route_hops": 2,
         }
         log = SimpleNamespace(
             op_id=0,
@@ -79,13 +92,29 @@ class ExperimentOutputTest(unittest.TestCase):
             noc_bcast_byte_hops=10,
             noc_shift_byte_hops=20,
             noc_reduce_byte_hops=30,
-            noc_byte_hops=60,
+            operator_noc_byte_hops=60,
+            dram_noc_read_byte_hops=40,
+            dram_noc_write_byte_hops=20,
+            dram_noc_byte_hops=60,
+            noc_byte_hops=120,
+            energy_noc_operator=720,
+            energy_noc_dram_transport=720,
+            energy_noc_control=24,
+            energy_noc=1464,
+            noc_dynamic_power_W=0.001464,
             dram_placement_policy=placement,
             spatial_meta={
                 "dram_access_records": [{
                     "tensor_id": 42, "stage": "read", "address": 4096,
                     "allocation_bytes": 8192, "total_bytes": 1024,
                     "bank_ids": [0, 8], "channel_ids": [0],
+                    "requester_core_weights": [[3, 1024]],
+                    "dram_noc_channel_ids": [0],
+                    "channel_noc_nodes": [15],
+                    "dram_noc_byte_hops": 40,
+                    "dram_noc_cycles": 11,
+                    "dram_noc_max_hops": 2,
+                    "dram_noc_max_link_bytes": 512,
                 }],
             },
         )
@@ -117,10 +146,23 @@ class ExperimentOutputTest(unittest.TestCase):
         self.assertEqual(record["metrics"]["end_to_end_time_ms"], 0.001)
         self.assertEqual(record["metrics"]["row_buffer"]["total"]["conflicts"], 12)
         self.assertEqual(record["metrics"]["dram_dynamic_energy_pj"]["total"], 95_640)
+        self.assertEqual(record["metrics"]["noc_byte_hops"]["total"], 120)
+        self.assertEqual(record["metrics"]["noc_byte_hops"]["dram_total"], 60)
+        self.assertEqual(record["metrics"]["noc_dynamic_energy_pj"]["control"], 24)
+        self.assertEqual(record["metrics"]["noc_dynamic_energy_pj"]["total"], 1464)
+        self.assertEqual(record["metrics"]["dram_noc_cycles"]["read"], 11)
+        self.assertEqual(record["metrics"]["noc_max_link_bytes"], 512)
+        self.assertEqual(record["metrics"]["noc_max_route_hops"], 2)
         self.assertEqual(record["operators"][0]["placement"]["bank_ids"], [0, 8])
         self.assertEqual(
             record["operators"][0]["placement"]["tensor_accesses"][0]["address"],
             4096,
+        )
+        self.assertEqual(
+            record["operators"][0]["placement"]["tensor_accesses"][0][
+                "requester_core_weights"
+            ],
+            [[3, 1024.0]],
         )
         self.assertEqual(record["tiling"][0]["spatial"], [8, 32])
 

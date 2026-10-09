@@ -207,13 +207,41 @@ NoC traffic x hops (byte-hop): Total=..., Broadcast=..., Shift=..., Reduce=...
 ```
 
 The total is the workload sum of bytes crossing NoC links, with one byte sent
-over one hop counted as one byte-hop. It is computed from the final selected
-spatial/temporal tiling, using the same approximate dimension-to-topology
-mapping as the default NoC latency model. Per-operator values are printed in
+over one hop counted as one byte-hop. Operator broadcast/shift/reduce traffic
+uses the same approximate dimension mapping as the default operator NoC
+latency model; DRAM-to-core traffic uses explicit dimension-ordered paths.
+Per-operator values are printed in
 the detailed log and stored on each pickled `FusedOperatorExecLog` as
 `noc_byte_hops`, `noc_bcast_byte_hops`, `noc_shift_byte_hops`, and
 `noc_reduce_byte_hops`; direct `run_tsim()` callers receive the corresponding
 aggregate keys in `stats`.
+
+Final execution also accounts for DRAM-channel-to-core traffic. X DRAM
+channels bind to X balanced contiguous groups of the Y dimension-ordered mesh
+cores (X must not exceed Y), and each channel injects at its group's lower
+middle core. Reads route from that node to requester cores and writes route in
+the reverse direction using deterministic X-then-Y paths. Traffic is
+aggregated on directed links without expanding 128-byte transactions. The
+most-loaded link determines payload cycles, with one mesh startup charge and
+one router-pipeline cycle per maximum route hop; DRAM and NoC payload phases
+are treated as streaming, so stage latency is their maximum. Results expose
+operator, DRAM-read, DRAM-write, and total byte-hops plus DRAM-NoC cycles.
+
+NoC dynamic transport energy is hop-aware, while the existing synchronization
+and control term is retained separately:
+
+```text
+E_NoC,transport = e_NoC,byte-hop x total NoC byte-hops
+E_NoC,dyn = E_NoC,control + E_NoC,transport
+```
+
+The L1 default is `e_NoC,byte-hop = 12 pJ/(byte-hop)`. The coefficient,
+DRAM-NoC startup cycles, and router pipeline cycles per hop are NoC hardware
+configuration fields. Hop-aware transport replaces, rather than augments, the
+legacy volume-only movement estimate; legacy sync/control energy is not
+discarded. The experiment schema reports control, operator transport, DRAM
+transport, their total, and average NoC dynamic power. DRAM and TSV energy
+remain separate and are not included in this NoC term.
 
 DRAM dynamic energy includes both byte-transfer energy and an explicit row-
 conflict penalty:

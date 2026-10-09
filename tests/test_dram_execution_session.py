@@ -141,6 +141,34 @@ class DRAMExecutionSessionTest(unittest.TestCase):
         self.assertEqual(result.records[0]["channel_ids"], [1])
         self.assertEqual(set(result.records[0]["bank_ids"]), {1, 3})
         self.assertEqual(result.records[0]["channel_noc_nodes"], [5])
+        self.assertEqual(result.read.noc_byte_hops, 256.0)
+        self.assertEqual(result.read.noc_max_hops, 2)
+        self.assertEqual(result.read.noc_cycles, 30)
+
+    def test_dram_noc_distance_changes_byte_hops_and_latency(self):
+        noc = NoC(16, Topo.MESH, list(range(8)))
+
+        def schedule_for(core):
+            dram = make_dram(banks=2, channels=2, bytepc=1024)
+            session = dram.new_execution_session(
+                placement_policy="address_trace",
+                replication_factor=1,
+                noc=noc,
+            )
+            access = record("read", core, 128)
+            access["address"] = 0
+            access["allocation_bytes"] = 128
+            access["requester_core_weights"] = [[core, 128]]
+            return session.schedule_records([access], op_index=0)
+
+        near = schedule_for(0)
+        far = schedule_for(7)
+        self.assertEqual(near.read.noc_byte_hops, 128.0)
+        self.assertEqual(far.read.noc_byte_hops, 384.0)
+        self.assertEqual(near.read.noc_cycles, 29)
+        self.assertEqual(far.read.noc_cycles, 31)
+        self.assertLess(near.read.noc_cycles, far.read.noc_cycles)
+        self.assertLess(near.read.cycles, far.read.cycles)
 
 
 if __name__ == "__main__":

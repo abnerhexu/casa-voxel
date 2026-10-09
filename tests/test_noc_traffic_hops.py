@@ -53,6 +53,16 @@ class NoCTrafficHopsTest(unittest.TestCase):
         self.assertEqual(byte_hops[1], 360.0)
         self.assertEqual(sum(byte_hops), 760.0)
 
+    def test_dimension_ordered_mesh_path_is_x_then_y(self):
+        self.assertEqual(
+            self.noc.get_dimension_ordered_path(0, 3),
+            [0, 1, 3],
+        )
+        self.assertEqual(
+            self.noc.get_dimension_ordered_path(3, 0),
+            [3, 2, 0],
+        )
+
     def test_spmd_reclassifies_cycles_not_traffic(self):
         args = (
             [100, 200],
@@ -200,6 +210,10 @@ class NoCTrafficHopsTest(unittest.TestCase):
         self.assertEqual(stats["noc_bcast_byte_hops"], 1200.0)
         self.assertEqual(stats["noc_shift_byte_hops"], 1440.0)
         self.assertEqual(stats["noc_reduce_byte_hops"], 400.0)
+        self.assertEqual(stats["operator_noc_byte_hops"], 3040.0)
+        self.assertEqual(stats["dram_noc_byte_hops"], 0.0)
+        self.assertEqual(stats["noc_energy"], 3040.0 * 12.0)
+        self.assertEqual(logs[0].energy_noc, 760.0 * 12.0)
         self.assertEqual(logs[0].noc_byte_hops, 760.0)
         self.assertEqual(stats["experiment"]["metrics"]["noc_byte_hops"]["total"], 3040.0)
         self.assertEqual(stats["experiment"]["workload"]["total_layers"], 4)

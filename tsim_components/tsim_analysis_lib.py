@@ -267,7 +267,9 @@ class HardwareExecutionState:
 
     def perform_op(self, dram_r_start: int, dram_r_duration: int, noc_bcast_duration: int, comp_shift_duration: int,
                     noc_reduce_duration: int, dram_w_duration: int, op_idx: int, hot_cold_table: List[Tuple[int, int]],
-                    exe_next_avail: int, overlap_bcast_dram_read: bool = False) -> Tuple[int, int, int, int, int, int]:
+                    exe_next_avail: int, overlap_bcast_dram_read: bool = False,
+                    dram_r_uses_noc: bool = False,
+                    dram_w_uses_noc: bool = False) -> Tuple[int, int, int, int, int, int]:
         '''
         Log the effect of performing an operation with the given hardware unit occupancy duration and start time (dram_r_start).
         Computing the next available cycle of dram_r availability can be done by adding the start and duration of dram read.
@@ -303,6 +305,13 @@ class HardwareExecutionState:
         # print(f"Execution: op {op_idx}")
         # self.free_executions(dram_r_start) # Free finished ops before executing new one.
         self.dram_r_next_avail_cycle = dram_r_start + dram_r_duration # Now reflects end of DRAM read for op(op_idx)
+        if dram_r_uses_noc:
+            # The caller has already delayed dram_r_start until the shared
+            # NoC is free. Reserve it through the complete streaming stage;
+            # the stage duration is max(DRAM service, NoC transport).
+            self.noc_next_avail_cycle = max(
+                self.noc_next_avail_cycle, self.dram_r_next_avail_cycle
+            )
         self.update_preloads(self.dram_r_next_avail_cycle, hot_cold_table, op_idx) # If preload space is available, we can start preloading as soon as dram is ready
         if overlap_bcast_dram_read:
             # broadcast prerequisites: noc available and must end concurrently with dram read at the earliest
@@ -340,6 +349,10 @@ class HardwareExecutionState:
         if(dram_w_duration > 0):
             finish_time = dram_w_start + dram_w_duration # exe space freed here
             self.dram_w_next_avail_cycle = dram_w_start + dram_w_duration # Now reflects end of DRAM write for op(op_idx)
+            if dram_w_uses_noc:
+                self.noc_next_avail_cycle = max(
+                    self.noc_next_avail_cycle, finish_time
+                )
         else:
             finish_time = noc_reduce_start + noc_reduce_duration
 
@@ -400,6 +413,7 @@ class FusedOperatorExecLog:
         self.energy_sa          = energy[3]["sa"]
         self.energy_vu          = energy[3]["vu"]
         self.energy_noc         = energy[3]["noc"]
+        self.energy_noc_control = float(energy[3].get("noc_control", 0.0))
         self.energy_sram        = energy[3]["sram"]
         self.energy_dram        = energy[3]["dram"]
         self.energy_tsv         = energy[3]["tsv"]
@@ -428,6 +442,40 @@ class FusedOperatorExecLog:
         )
         self.energy_dram_row_conflict = float(
             dram_energy_meta.get("row_conflict", 0.0)
+        )
+        dram_noc_meta = (spatial_meta or {}).get("dram_noc", {})
+        dram_noc_read = dram_noc_meta.get("read", {})
+        dram_noc_write = dram_noc_meta.get("write", {})
+        self.dram_noc_read_cycles = int(dram_noc_read.get("cycles", 0))
+        self.dram_noc_write_cycles = int(dram_noc_write.get("cycles", 0))
+        self.dram_noc_read_byte_hops = float(
+            dram_noc_read.get("byte_hops", 0.0)
+        )
+        self.dram_noc_write_byte_hops = float(
+            dram_noc_write.get("byte_hops", 0.0)
+        )
+        self.dram_noc_byte_hops = (
+            self.dram_noc_read_byte_hops + self.dram_noc_write_byte_hops
+        )
+        self.dram_noc_read_max_hops = int(
+            dram_noc_read.get("max_hops", 0)
+        )
+        self.dram_noc_write_max_hops = int(
+            dram_noc_write.get("max_hops", 0)
+        )
+        self.dram_noc_max_hops = max(
+            self.dram_noc_read_max_hops,
+            self.dram_noc_write_max_hops,
+        )
+        self.dram_noc_read_max_link_bytes = float(
+            dram_noc_read.get("max_link_bytes", 0.0)
+        )
+        self.dram_noc_write_max_link_bytes = float(
+            dram_noc_write.get("max_link_bytes", 0.0)
+        )
+        self.dram_noc_max_link_bytes = max(
+            self.dram_noc_read_max_link_bytes,
+            self.dram_noc_write_max_link_bytes,
         )
         exec_time_s = self.exec_dur / (npu_freq_MHz * 1e6)
         self.dram_dynamic_power_W = (
@@ -482,9 +530,13 @@ class FusedOperatorExecLog:
 
         #Translates pipeline stage to the active hw unit(s) during that stage
         self.stage_units = {
-            "dram_r" : ["dram_r"],
+            "dram_r" : ["dram_r"] + (
+                ["noc"] if self.dram_noc_read_cycles > 0 else []
+            ),
             "noc_bcast_sh" : ["noc"],
-            "dram_w" : ["dram_w"],
+            "dram_w" : ["dram_w"] + (
+                ["noc"] if self.dram_noc_write_cycles > 0 else []
+            ),
             "comp" : ["comp"],
             "comp_sram_r" :["comp_sram_r"],
             "comp_sram_w" : ["comp_sram_w"],
@@ -544,7 +596,17 @@ class FusedOperatorExecLog:
             f"Total={getattr(self, 'noc_byte_hops', 0)}, "
             f"Broadcast={getattr(self, 'noc_bcast_byte_hops', 0)}, "
             f"Shift={getattr(self, 'noc_shift_byte_hops', 0)}, "
-            f"Reduce={getattr(self, 'noc_reduce_byte_hops', 0)}\n"
+            f"Reduce={getattr(self, 'noc_reduce_byte_hops', 0)}, "
+            f"DRAMRead={getattr(self, 'dram_noc_read_byte_hops', 0)}, "
+            f"DRAMWrite={getattr(self, 'dram_noc_write_byte_hops', 0)}\n"
+        )
+        noc_energy_str = (
+            "NoC dynamic energy (hop-aware): "
+            f"Control={getattr(self, 'energy_noc_control', 0.0)} pJ, "
+            f"Operator={getattr(self, 'energy_noc_operator', 0.0)} pJ, "
+            f"DRAMTransport={getattr(self, 'energy_noc_dram_transport', 0.0)} pJ, "
+            f"Total={getattr(self, 'energy_noc', 0.0)} pJ, "
+            f"Power={getattr(self, 'noc_dynamic_power_W', 0.0)} W\n"
         )
         dram_conflict_str = (
             "DRAM row conflicts (ACT+PRE): "
@@ -571,7 +633,7 @@ class FusedOperatorExecLog:
         # interval_str = (" ").join([str(ival) for ival in self.intervals])
         return (op_str + event_str + dur_str + interval_str + comp_util_str
                 + traffic_str + noc_traffic_hops_str + dram_conflict_str
-                + dram_row_buffer_str + power_str)
+                + noc_energy_str + dram_row_buffer_str + power_str)
 
     def __repr__(self):
         '''

@@ -1844,10 +1844,15 @@ class DNNProgram:
         Returns:
             A 4-tuple ``(total_dynamic_energy_pJ, compute_energy_pJ,
             sss_energy_pJ, per_component_energy_dict)``.  The dict keys are
-            ``"sa"``, ``"vu"``, ``"sram"``, ``"noc"``, ``"dram"``, ``"tsv"``.
+            ``"sa"``, ``"vu"``, ``"sram"``, ``"noc"``, ``"dram"``, ``"tsv"``
+            plus ``"noc_control"``, which is metadata already included in
+            ``"noc"`` rather than an additional energy component.
         """
         total_dyn_energy, comp_energy, sss_energy, ssi_energy = 0, 0, 0, 0
-        per_component_energy = {"sa": 0, "vu": 0, "sram": 0, "noc": 0}
+        energy_components = ("sa", "vu", "sram", "noc")
+        per_component_energy = {
+            "sa": 0, "vu": 0, "sram": 0, "noc": 0, "noc_control": 0
+        }
         for idx, op in enumerate(fused_op):
             temporal, spatial = next(part_it)
             cfg_perf, energy_breakdown = self.get_op_perf(op, temporal, spatial)
@@ -1856,8 +1861,11 @@ class DNNProgram:
             sss_energy += cfg_perf.sss_cycles.energy
             assert math.isclose(cfg_perf.total_cycles.energy, sum(energy_breakdown.values()), rel_tol=1e-4), \
                 f"Energy breakdown sum {sum(energy_breakdown.values())} does not match total dynamic energy {cfg_perf.total_cycles.energy}"
-            for component in per_component_energy:
+            for component in energy_components:
                 per_component_energy[component] += energy_breakdown[component]
+            per_component_energy["noc_control"] += (
+                op.expr.get_noc_control_energy(temporal, spatial)
+            )
 
         # --- Off-chip energy: DRAM and TSV ---
         # Baseline transfer energy references (pJ/byte):
@@ -1879,7 +1887,14 @@ class DNNProgram:
 
         total_dyn_energy += dram_dyn_energy
         total_dyn_energy += tsv_energy
-        assert math.isclose(total_dyn_energy, sum(per_component_energy.values()), rel_tol=1e-4), "op-level energy mismatch."
+        assert math.isclose(
+            total_dyn_energy,
+            sum(
+                energy for component, energy in per_component_energy.items()
+                if component != "noc_control"
+            ),
+            rel_tol=1e-4,
+        ), "op-level energy mismatch."
         return total_dyn_energy, comp_energy, sss_energy, per_component_energy
 
     def get_op_perf(self, op: TensorOperator, temporal, spatial) -> Tuple[perf, dict]:
@@ -2086,6 +2101,26 @@ class DNNProgram:
                 "read": dram_schedule.read.as_dict(),
                 "write": dram_schedule.write.as_dict(),
                 "placement_policy": placement_policy,
+            }
+            op_spatial_meta["dram_noc"] = {
+                "read": {
+                    "cycles": int(dram_schedule.read.noc_cycles),
+                    "byte_hops": float(dram_schedule.read.noc_byte_hops),
+                    "max_link_bytes": float(
+                        dram_schedule.read.noc_max_link_bytes
+                    ),
+                    "max_hops": int(dram_schedule.read.noc_max_hops),
+                    "flow_count": int(dram_schedule.read.noc_flow_count),
+                },
+                "write": {
+                    "cycles": int(dram_schedule.write.noc_cycles),
+                    "byte_hops": float(dram_schedule.write.noc_byte_hops),
+                    "max_link_bytes": float(
+                        dram_schedule.write.noc_max_link_bytes
+                    ),
+                    "max_hops": int(dram_schedule.write.noc_max_hops),
+                    "flow_count": int(dram_schedule.write.noc_flow_count),
+                },
             }
             op_spatial_meta["dram_energy_breakdown_pj"] = {
                 "base_transfer": float(
@@ -2401,12 +2436,25 @@ class DNNProgram:
 
                 # Determine when execution space becomes available for this op
                 exec_space_next_avail = exec_state.get_exec_next_avail(hot_cold_table[idx][0])
+                op_spatial_meta = (
+                    spatial_meta[idx]
+                    if spatial_meta and idx < len(spatial_meta) else {}
+                )
+                dram_noc_meta = (op_spatial_meta or {}).get("dram_noc", {})
+                dram_r_uses_noc = int(
+                    dram_noc_meta.get("read", {}).get("cycles", 0)
+                ) > 0
+                dram_w_uses_noc = int(
+                    dram_noc_meta.get("write", {}).get("cycles", 0)
+                ) > 0
 
                 # Decide when DRAM read can start based on preload / overlap state
                 if idx in exec_state.reserved_preloads:
                     # Preloaded: start as soon as both DRAM port and preload space are free
-                    dram_r_start = max(exec_state.dram_r_next_avail_cycle,
-                                       exec_state.reserved_preloads[idx].preload_avail_time)
+                    dram_r_start = max(
+                        exec_state.dram_r_next_avail_cycle,
+                        exec_state.reserved_preloads[idx].preload_avail_time,
+                    )
                 else:
                     # Not preloaded: must wait for execution space
                     if idx > 0 and exec_state.remaining_execution_space < hot_cold_table[idx][0]:
@@ -2418,6 +2466,10 @@ class DNNProgram:
                         # Enough residual space -> overlap DRAM read with previous op's tail
                         dram_r_start = max(exec_state.dram_r_next_avail_cycle,
                                            exec_space_next_avail)
+                if dram_r_uses_noc:
+                    dram_r_start = max(
+                        dram_r_start, exec_state.noc_next_avail_cycle
+                    )
 
                 # Execute the five-phase pipeline for this operator
                 op_data = exec_state.perform_op(
@@ -2430,9 +2482,12 @@ class DNNProgram:
                     op_idx=idx,
                     hot_cold_table=hot_cold_table,
                     exe_next_avail=exec_space_next_avail,
-                    overlap_bcast_dram_read=overlap_bcast_read)
+                    overlap_bcast_dram_read=(
+                        overlap_bcast_read and not dram_r_uses_noc
+                    ),
+                    dram_r_uses_noc=dram_r_uses_noc,
+                    dram_w_uses_noc=dram_w_uses_noc)
 
-                op_spatial_meta = spatial_meta[idx] if spatial_meta and idx < len(spatial_meta) else None
                 op_spatial_meta = self._attach_dram_access_timing(
                     op_spatial_meta,
                     read_start_cycle=op_data[0],

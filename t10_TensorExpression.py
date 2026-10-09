@@ -759,6 +759,56 @@ class TensorExpression:
         return time, shift_energy + sync_energy + gather_energy + reduce_energy + time*SHIFT_INSTR_BYTE_PER_CYCLE*READ_PJ + time * IDLE_PJ_PER_CORE_CYCLE, per_comp_breakdown
     # time*SHIFT_INSTR_BYTE_PER_CYCLE*READ_PJ # + time*IDLE_PJ_PER_CORE_CYCLE,
 
+    def get_noc_control_energy(
+        self,
+        temporal_dim_var_parts: List[List[int]],
+        spatial_dim_parts: List[int],
+    ) -> float:
+        """Return legacy NoC sync/control energy, excluding byte movement.
+
+        This mirrors the control terms in ``get_sync_shift_time_energy`` and
+        ``get_shuffle_time_energy``.  Keeping the split here lets TSim replace
+        only legacy volume-based transport with hop-aware transport while
+        retaining the existing synchronization cost.
+        """
+        shift_info = self.get_shift_info(
+            temporal_dim_var_parts, spatial_dim_parts
+        )
+        total_num_shifts = 0
+        iter_acc = 1
+        for num_shifts, variables in zip(shift_info[2], shift_info[3]):
+            total_num_shifts += iter_acc * num_shifts * len(variables)
+            iter_acc *= num_shifts + 1
+        sync_shift_control = (
+            BUFFER_ITERS * total_num_shifts * DATAMOVE_PJ
+        )
+
+        if self.op_type in [
+            self.OP_TYPE_ELEMENT, self.OP_TYPE_RELU, self.OP_TYPE_POOL
+        ]:
+            shuffle_control = DATAMOVE_PJ
+        else:
+            num_output_replica = round(
+                self.spatial_var_replicas[0]
+                / np.prod(temporal_dim_var_parts, axis=0)[0]
+            )
+            if num_output_replica <= 1:
+                gather_control = 0.0
+            elif num_output_replica == 2:
+                gather_control = 2 * DATAMOVE_PJ
+            else:
+                gather_control = num_output_replica * DATAMOVE_PJ
+            shuffle_control = (
+                gather_control
+                + BUFFER_ITERS * DATAMOVE_PJ
+                + DATAMOVE_PJ  # NoC half of the shuffle sync energy.
+            )
+
+        return float(
+            (sync_shift_control + shuffle_control)
+            * np.prod(spatial_dim_parts)
+        )
+
     # return compute time per iter
     # 0: reduce, 1:relu, 2:elementwise, 3:pooling, 4:conv, 5:matmul
     def get_comp_time_per_iter(self, temporal_dim_var_parts:List[List[int]]) -> float:

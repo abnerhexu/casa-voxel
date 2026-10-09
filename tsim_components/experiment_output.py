@@ -8,8 +8,10 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from tsim_components.noc import NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP, Topo
 
-EXPERIMENT_SCHEMA_VERSION = 2
+
+EXPERIMENT_SCHEMA_VERSION = 3
 
 
 def _json_value(value: Any) -> Any:
@@ -57,6 +59,34 @@ def _operator_record(log: object, tiling: Mapping[str, Any] | None) -> dict:
                 int(channel)
                 for channel in (access.get("channel_ids", []) or [])
             ],
+            "requester_core_weights": [
+                [int(core), float(weight)]
+                for core, weight in (
+                    access.get("requester_core_weights", []) or []
+                )
+            ],
+            "channel_noc_nodes": [
+                int(node)
+                for node in (access.get("channel_noc_nodes", []) or [])
+            ],
+            "dram_noc_channel_ids": [
+                int(channel)
+                for channel in (
+                    access.get("dram_noc_channel_ids", []) or []
+                )
+            ],
+            "dram_noc_byte_hops": float(
+                access.get("dram_noc_byte_hops", 0.0) or 0.0
+            ),
+            "dram_noc_cycles": int(
+                access.get("dram_noc_cycles", 0) or 0
+            ),
+            "dram_noc_max_hops": int(
+                access.get("dram_noc_max_hops", 0) or 0
+            ),
+            "dram_noc_max_link_bytes": float(
+                access.get("dram_noc_max_link_bytes", 0.0) or 0.0
+            ),
         }
         for access in accesses
     ]
@@ -100,7 +130,43 @@ def _operator_record(log: object, tiling: Mapping[str, Any] | None) -> dict:
             "broadcast": float(getattr(log, "noc_bcast_byte_hops", 0.0)),
             "shift": float(getattr(log, "noc_shift_byte_hops", 0.0)),
             "reduce": float(getattr(log, "noc_reduce_byte_hops", 0.0)),
+            "operator_total": float(
+                getattr(log, "operator_noc_byte_hops", 0.0)
+            ),
+            "dram_read": float(
+                getattr(log, "dram_noc_read_byte_hops", 0.0)
+            ),
+            "dram_write": float(
+                getattr(log, "dram_noc_write_byte_hops", 0.0)
+            ),
+            "dram_total": float(
+                getattr(log, "dram_noc_byte_hops", 0.0)
+            ),
             "total": float(getattr(log, "noc_byte_hops", 0.0)),
+        },
+        "noc_dynamic_energy_pj": {
+            "energy_per_byte_hop": float(getattr(
+                log,
+                "noc_energy_pj_per_byte_hop",
+                NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP,
+            )),
+            "control": float(
+                getattr(log, "energy_noc_control", 0.0)
+            ),
+            "operator_transport": float(
+                getattr(log, "energy_noc_operator", 0.0)
+            ),
+            "dram_transport": float(
+                getattr(log, "energy_noc_dram_transport", 0.0)
+            ),
+            "transport_total": float(
+                getattr(log, "energy_noc_operator", 0.0)
+                + getattr(log, "energy_noc_dram_transport", 0.0)
+            ),
+            "total": float(getattr(log, "energy_noc", 0.0)),
+            "average_power_w": float(
+                getattr(log, "noc_dynamic_power_W", 0.0)
+            ),
         },
         "placement": {
             "policy": str(getattr(log, "dram_placement_policy", "unknown")),
@@ -201,6 +267,24 @@ def build_experiment_record(
                 "link_bandwidth_bytes_per_cycle": float(
                     getattr(noc, "bandwidth_bytepc", 0.0)
                 ),
+                "routing": (
+                    "dimension_ordered_xy"
+                    if getattr(noc, "topology", None) == Topo.MESH
+                    else "shortest_path"
+                ),
+                "dynamic_energy_pj_per_byte_hop": (
+                    float(getattr(
+                        noc,
+                        "energy_pj_per_byte_hop",
+                        NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP,
+                    ))
+                ),
+                "router_pipeline_cycles_per_hop": int(getattr(
+                    noc, "router_pipeline_cycles_per_hop", 1
+                )),
+                "dram_noc_startup_cycles": getattr(
+                    noc, "dram_noc_startup_cycles", None
+                ),
             },
             "dram": {
                 **geometry,
@@ -278,8 +362,52 @@ def build_experiment_record(
                 "broadcast": float(stats.get("noc_bcast_byte_hops", 0.0)),
                 "shift": float(stats.get("noc_shift_byte_hops", 0.0)),
                 "reduce": float(stats.get("noc_reduce_byte_hops", 0.0)),
+                "operator_total": float(
+                    stats.get("operator_noc_byte_hops", 0.0)
+                ),
+                "dram_read": float(
+                    stats.get("dram_noc_read_byte_hops", 0.0)
+                ),
+                "dram_write": float(
+                    stats.get("dram_noc_write_byte_hops", 0.0)
+                ),
+                "dram_total": float(stats.get("dram_noc_byte_hops", 0.0)),
                 "total": float(stats.get("noc_byte_hops", 0.0)),
             },
+            "noc_dynamic_energy_pj": {
+                "energy_per_byte_hop": float(getattr(
+                    noc,
+                    "energy_pj_per_byte_hop",
+                    NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP,
+                )),
+                "control": float(
+                    stats.get("noc_control_energy", 0.0)
+                ),
+                "operator_transport": float(
+                    stats.get("noc_operator_energy", 0.0)
+                ),
+                "dram_transport": float(
+                    stats.get("noc_dram_transport_energy", 0.0)
+                ),
+                "transport_total": float(
+                    stats.get("noc_operator_energy", 0.0)
+                    + stats.get("noc_dram_transport_energy", 0.0)
+                ),
+                "total": float(stats.get("noc_energy", 0.0)),
+                "average_power_w": float(
+                    stats.get("noc_dynamic_power_w", 0.0)
+                ),
+            },
+            "dram_noc_cycles": {
+                "read": int(stats.get("dram_noc_read_cycles", 0)),
+                "write": int(stats.get("dram_noc_write_cycles", 0)),
+            },
+            "noc_max_link_bytes": float(
+                stats.get("noc_max_link_bytes", 0.0)
+            ),
+            "noc_max_route_hops": int(
+                stats.get("noc_max_route_hops", 0)
+            ),
             "total_dynamic_energy_pj": float(stats.get("exec_energy", 0.0)),
         },
         "cache": {"tiling": _json_value(tiling_cache or {})},
