@@ -2,6 +2,7 @@ import unittest
 
 from tsim_components.dram_placement import (
     SUPPORTED_DRAM_PLACEMENTS,
+    build_placement_plan,
     channel_aware_placements,
     record_signature,
     software_aware_placements,
@@ -106,6 +107,19 @@ class DRAMPlacementTest(unittest.TestCase):
     def test_invalid_channel_geometry_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "must be divisible"):
             channel_aware_placements(make_records(), 16, 3)
+
+    def test_shared_builder_supports_every_public_policy(self):
+        records = make_records()
+        for policy in SUPPORTED_DRAM_PLACEMENTS:
+            with self.subTest(policy=policy):
+                plan = build_placement_plan(
+                    records, total_banks=16, num_channels=4,
+                    policy=policy, seed=11, stripe_bytes=128,
+                )
+                self.assertEqual(len(plan), len(records))
+                for placement in plan.values():
+                    self.assertEqual(placement.policy, policy)
+                    self.assertTrue(placement.bank_ids)
 
 
 if __name__ == "__main__":

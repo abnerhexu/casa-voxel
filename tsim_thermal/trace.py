@@ -1449,15 +1449,23 @@ def dram_mapping_record_events(
 ) -> List[Dict[str, Any]]:
     """Return per-tensor DRAM events decoded according to the configured mapping."""
     mapping = resolve_dram_bank_mapping(cfg, artifact)
-    if mapping == "address_trace":
-        return dram_address_trace_record_events(meta, kind, cfg, artifact, op, op_position, package_count)
-
     records = _dram_access_records_for_stage(meta, kind)
     if not records:
         return []
 
     banks_per_package = max(1, int(cfg.hbm_banks_per_package))
     total_banks = max(1, int(package_count) * banks_per_package)
+    has_execution_placement = all(
+        record.get("placement_policy") == mapping
+        and record.get("bank_ids")
+        and all(0 <= int(bank) < total_banks for bank in record["bank_ids"])
+        for record in records
+    )
+    if mapping == "address_trace" and not has_execution_placement:
+        return dram_address_trace_record_events(
+            meta, kind, cfg, artifact, op, op_position, package_count
+        )
+
     stripe_bytes = max(1, int(cfg.hbm_interleave_stripe_bytes))
     op_id = int(getattr(op, "op_id", op_position))
     stage_start = int(getattr(op, "t_dram_ld_start" if kind == "read" else "t_dram_st_start", 0))
@@ -1490,7 +1498,16 @@ def dram_mapping_record_events(
             record.get("scheduled_cycles", record.get("cycles_per_core", stage_duration)),
         ))
 
-        if mapping == "uniform":
+        recorded_banks = (
+            tuple(int(bank) for bank in record.get("bank_ids", ()))
+            if record.get("placement_policy") == mapping else tuple()
+        )
+        if recorded_banks and all(0 <= bank < total_banks for bank in recorded_banks):
+            bank_weights = {
+                bank: float(total_bytes) / len(recorded_banks)
+                for bank in recorded_banks
+            }
+        elif mapping == "uniform":
             bank_weights = {bank: float(total_bytes) / total_banks for bank in range(total_banks)}
         elif mapping == "hbm_interleave":
             base_address = _synthetic_tensor_base_address(record, op, op_position, kind, stripe_bytes, total_banks)

@@ -228,10 +228,13 @@ The base term is `(read_bytes + write_bytes) * 7 pJ/byte`. A conflict is
 counted when an access replaces an already-open row in the same bank; the
 initial ACT in an empty bank is not a conflict. Each conflict adds one
 PRE+ACT pair at 7.27 nJ (7270 pJ). Counts and energies are also exposed in
-`run_tsim()` statistics and per-operator pickle fields. The internal and
-external precise timing modes use a synthesized, bank-striped request stream,
-so these conflict counts reflect VOXEL's mapping model rather than a captured
-physical command trace.
+`run_tsim()` statistics and per-operator pickle fields. Final-tiling execution
+uses one placement-aware row-event stream for DRAM latency, row hit/miss/
+conflict counts, and conflict energy. Open rows persist between fused
+operators, and a bounded hit-first request window approximates FR-FCFS without
+requiring Ramulator. Row runs are coalesced per bank, so simulation work is
+bounded by tensor records times banks instead of the number of 128-byte
+transactions. tRAS is not modelled.
 
 DRAM configurations may describe physical geometry explicitly with
 `num_layers`, `banks_per_layer`, `num_channels`, `bytes_per_row`, and
@@ -255,6 +258,10 @@ explicit channel load balancing. It assigns large tensor records first to the
 least-loaded channels, selects deterministic bank stripes inside each channel,
 and maintains separate read/write cursors. A channel-count sweep therefore
 recomputes placement while retaining the selected spatial/temporal tiling.
+Use `--dram_placement` to select `address_trace`, `hbm_interleave`, `uniform`,
+`interleave_size`, `software_aware`, or `channel_aware`; the selected physical
+banks are retained in tensor access records so thermal mapping can consume the
+same execution placement.
 
 ### 3.4 Generate Figures (Figs 10–20)
 

@@ -407,6 +407,8 @@ class DNNProgram:
         max_hot_size: Largest hot-size requirement across all operators.
         uniform_dram_mapping: If ``True``, simulate sub-optimal DRAM address
             mapping (used for sensitivity studies).
+        dram_placement_policy: Physical tensor-to-bank placement used by the
+            unified DRAM execution session.
         ipu_no_overlap: If ``True``, disable pipeline overlap between
             operators (IPU-style sequential execution).
         op_init_overhead: Fixed per-operator startup overhead in cycles.
@@ -466,6 +468,7 @@ class DNNProgram:
         self.max_hot_size: int = 0
 
         self.uniform_dram_mapping: bool = False
+        self.dram_placement_policy: str = "software_aware"
         self.ipu_no_overlap: bool = False
         self.ipu_trace_tag: str = ""
         self.op_init_overhead: int = 0
@@ -1655,6 +1658,14 @@ class DNNProgram:
         fused_op_energy = []
         comp_unit_stats = []
         spatial_meta = []
+        placement_policy = (
+            "uniform" if self.uniform_dram_mapping
+            else getattr(self, "dram_placement_policy", "software_aware")
+        )
+        dram_session = dram.new_execution_session(
+            placement_policy=placement_policy,
+            replication_factor=self.tot_num_cores,
+        )
         peak_sa_flopc, peak_vu_flopc = comp.get_peak_flopc()
         inv_tot_num_cores = 1.0 / self.tot_num_cores
         for (idx, fused_op) in enumerate(fused_ops):
@@ -1679,6 +1690,17 @@ class DNNProgram:
             if used_by_next:
                 dram_access_records.extend(last_op_write_records)
 
+            # Placement, timing, row-buffer counts, and conflict energy all
+            # consume this single event stream.  The old analytical values
+            # above remain useful during tiling search, but are replaced here
+            # once the final partition and write decision are known.
+            dram_schedule = dram_session.schedule_records(
+                dram_access_records, op_index=idx
+            )
+            read_cycles = dram_schedule.read.cycles
+            write_cycles = dram_schedule.write.cycles
+            dram_access_records = dram_schedule.records
+
             # --- 4. Compute unit statistics (per-core FLOPs and ideal cycles) ---
             sa_flop, vu_flop = self.get_fused_op_comp(fused_op)
             sa_flop *= inv_tot_num_cores   # chip-wide -> per-core
@@ -1693,8 +1715,8 @@ class DNNProgram:
             # Scale per-core byte traffic to chip-wide totals for energy model
             total_dram_r_traffic = dram_r_traffic * self.tot_num_cores
             total_dram_w_traffic = dram_w_traffic * self.tot_num_cores
-            total_dram_r_row_conflicts = dram_r_row_conflicts * self.tot_num_cores
-            total_dram_w_row_conflicts = dram_w_row_conflicts * self.tot_num_cores
+            total_dram_r_row_conflicts = dram_schedule.read.row_conflicts
+            total_dram_w_row_conflicts = dram_schedule.write.row_conflicts
             total_dram_row_conflicts = (
                 total_dram_r_row_conflicts + total_dram_w_row_conflicts
             )
@@ -1711,6 +1733,11 @@ class DNNProgram:
                 "read": int(total_dram_r_row_conflicts),
                 "write": int(total_dram_w_row_conflicts),
                 "total": int(total_dram_row_conflicts),
+            }
+            op_spatial_meta["dram_row_buffer"] = {
+                "read": dram_schedule.read.as_dict(),
+                "write": dram_schedule.write.as_dict(),
+                "placement_policy": placement_policy,
             }
             op_spatial_meta["dram_energy_breakdown_pj"] = {
                 "base_transfer": float(

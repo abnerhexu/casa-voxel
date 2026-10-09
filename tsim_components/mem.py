@@ -414,6 +414,25 @@ class DRAM:
             "transaction_bytes": self.transaction_bytes,
         }
 
+    def new_execution_session(
+        self,
+        placement_policy: str = "software_aware",
+        replication_factor: int = 1,
+        frfcfs_window: int = 32,
+    ):
+        """Create a stateful placement-aware timing/conflict session.
+
+        The import is local to keep the low-level memory model independent of
+        placement policy implementation details at module import time.
+        """
+        from tsim_components.dram_scheduler import DRAMExecutionSession
+        return DRAMExecutionSession(
+            self,
+            placement_policy=placement_policy,
+            replication_factor=replication_factor,
+            frfcfs_window=frfcfs_window,
+        )
+
     def _populate_from_dram_cache(self) -> None:
         """Populate ultra cache from pre-computed dram_cache files (``*.dcache``).
 

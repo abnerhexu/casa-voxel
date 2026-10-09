@@ -39,6 +39,7 @@ import t10_TensorExpression as TE
 from t10_utils import IPU_Mk2_cycle_to_ms
 
 from tsim_components.mem import DRAM, get_per_cycle_bytes_per_core_from_DRAM_config
+from tsim_components.dram_placement import SUPPORTED_DRAM_PLACEMENTS
 from tsim_components.comp_util import Compute_OP, Compute
 from tsim_components.noc import Topo, NoC
 from tsim_simple import run_tsim_helper, _init_worker, parse_results
@@ -258,6 +259,7 @@ def gen_pickle(args:argparse.Namespace, output_dir, layer, order_pickle_filename
                             num_cores=[args.num_cores], tot_mem_size_per_core=args.core_mem_kb*1024)
     prog.update_te_hw(comp, noc, args.spmd_compiler, args.seq_noc, args.ipu_tsim)
     prog.uniform_dram_mapping = args.uniform_dram_mapping
+    prog.dram_placement_policy = args.dram_placement
     prog.ipu_no_overlap = args.ipu_tsim
     if args.ipu_tsim:
         prog.ipu_trace_tag = f"{'prefill' if args.prefill else 'decode'}-ipu_tsim"
@@ -304,6 +306,11 @@ if __name__ == "__main__":
     parser.add_argument("--generate_order_only", action='store_true', required=False, default=False)
 
     parser.add_argument("--uniform_dram_mapping", action='store_true', required=False, default=False)
+    parser.add_argument(
+        "--dram_placement", required=False, default="software_aware",
+        choices=sorted(SUPPORTED_DRAM_PLACEMENTS),
+        help="Tensor-to-bank placement used by DRAM timing, row statistics, and energy.",
+    )
     parser.add_argument("--spmd_compiler", action='store_true', required=False, default=False)
     parser.add_argument("--seq_noc", action='store_true', required=False, default=False)
     parser.add_argument("--dataflow", action='store_true', required=False, default=False)
@@ -457,6 +464,11 @@ if __name__ == "__main__":
 
             with open(pickle_filename, 'wb') as f:
                 pickle.dump(prog, f)
+
+    # Runtime DRAM placement is intentionally independent from the compiled
+    # tiling pickle, so a single tiling result can be reused for all policies.
+    prog.uniform_dram_mapping = args.uniform_dram_mapping
+    prog.dram_placement_policy = args.dram_placement
 
     if args.generate_pickle_only or args.generate_order_only:
         exit(0)

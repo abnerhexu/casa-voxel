@@ -8,6 +8,7 @@ requests without reimplementing policy logic.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from math import ceil, floor
 from typing import Dict, Iterable, Mapping, Sequence, Tuple
@@ -68,6 +69,12 @@ def _rotating_indices(total: int, start: int, span: int) -> Tuple[int, ...]:
     span = max(1, min(total, int(span)))
     start = int(start) % total
     return tuple((start + offset) % total for offset in range(span))
+
+
+def stable_u64(*parts: object) -> int:
+    """Return a process-independent 64-bit hash for placement decisions."""
+    payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
 
 
 def _proportional_spans(weights: Sequence[int], capacity: int) -> Tuple[int, ...]:
@@ -203,3 +210,71 @@ def channel_aware_placements(
 
     return result
 
+
+def build_placement_plan(
+    records: Iterable[Mapping[str, object]],
+    total_banks: int,
+    num_channels: int,
+    policy: str,
+    seed: int = 0,
+    stripe_bytes: int = 128,
+) -> Dict[RecordSignature, TensorPlacement]:
+    """Build one deterministic physical-bank plan for any public policy.
+
+    This is the shared placement entry point for timing, conflict/energy,
+    and thermal consumers.  It deliberately returns bank IDs rather than
+    backend-specific events so every consumer observes the same placement.
+    """
+    total_banks = max(1, int(total_banks))
+    num_channels = max(1, int(num_channels))
+    stripe_bytes = max(1, int(stripe_bytes))
+    policy = str(policy).lower().replace("-", "_")
+    if policy not in SUPPORTED_DRAM_PLACEMENTS:
+        raise ValueError(
+            f"unsupported DRAM placement {policy!r}; expected one of "
+            f"{sorted(SUPPORTED_DRAM_PLACEMENTS)}"
+        )
+
+    ordered = sorted(
+        (record for record in records if record_bytes(record) > 0),
+        key=record_signature,
+    )
+    if policy == "software_aware":
+        return software_aware_placements(ordered, total_banks, seed)
+    if policy == "channel_aware":
+        return channel_aware_placements(
+            ordered, total_banks, num_channels, seed
+        )
+
+    max_bytes = max((record_bytes(record) for record in ordered), default=1)
+    result: Dict[RecordSignature, TensorPlacement] = {}
+    for ordinal, record in enumerate(ordered):
+        signature = record_signature(record)
+        size = record_bytes(record)
+        if policy == "uniform":
+            banks = tuple(range(total_banks))
+        elif policy == "interleave_size":
+            span = max(1, min(
+                total_banks,
+                int(ceil(total_banks * size / max_bytes)),
+            ))
+            start = stable_u64(policy, seed, *signature) % total_banks
+            banks = _rotating_indices(total_banks, start, span)
+        else:
+            # hbm_interleave and address_trace both stripe a deterministic
+            # synthetic address range.  If a trace supplies an address, it
+            # becomes the starting stripe; otherwise the tensor signature is
+            # a stable substitute.
+            address = record.get("address")
+            if address is None:
+                address = stable_u64(policy, seed, ordinal, *signature)
+            start = (int(address) // stripe_bytes) % total_banks
+            span = max(1, min(total_banks, int(ceil(size / stripe_bytes))))
+            banks = _rotating_indices(total_banks, start, span)
+
+        result[signature] = TensorPlacement(
+            policy=policy,
+            bank_ids=banks,
+            channel_ids=tuple(sorted({bank % num_channels for bank in banks})),
+        )
+    return result
