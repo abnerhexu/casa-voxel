@@ -57,6 +57,19 @@ class DRAMChannelBandwidthTest(unittest.TestCase):
         self.assertGreaterEqual(one_cycle, 8 * 128 / 32)
         self.assertGreaterEqual(four_cycle, 8 * 128 / 32)
 
+    def test_tiling_cost_and_key_ignore_channel_partition(self):
+        one_channel = make_dram(channels=1, precise=False)
+        four_channels = make_dram(channels=4, precise=False)
+
+        self.assertEqual(
+            one_channel.tiling_cache_signature(),
+            four_channels.tiling_cache_signature(),
+        )
+        self.assertEqual(
+            one_channel.num_cycle_of_access_for_tiling(4096, 128, True),
+            four_channels.num_cycle_of_access_for_tiling(4096, 128, True),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

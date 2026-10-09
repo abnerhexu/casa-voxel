@@ -263,6 +263,18 @@ Use `--dram_placement` to select `address_trace`, `hbm_interleave`, `uniform`,
 banks are retained in tensor access records so thermal mapping can consume the
 same execution placement.
 
+Tiling selection and DRAM placement use separate caches. The tiling key
+contains the operator/workload shape, execution SRAM limit, core-group size,
+compiled compute/NoC candidate costs, aggregate DRAM bandwidth, and channel-
+neutral DRAM timing/geometry. It excludes the placement policy and channel
+count, so a fixed-bandwidth channel sweep reuses tiling; bandwidth, SRAM, and
+NoC-cost sweeps create new tiling entries. Placement
+uses a separate LRU keyed by tensor access records, policy, channel count, bank
+geometry, and placement seed. `DNNProgram.save_tiling_cache()` and
+`load_tiling_cache()` persist only tiling choices, while
+`placement_cache_info()` and `clear_placement_cache()` inspect or clear only
+placement state. Program pickles created before this split remain readable.
+
 ### 3.4 Generate Figures (Figs 10–20)
 
 Once simulation data is ready (verify with the dry-run in Section 3.3), each

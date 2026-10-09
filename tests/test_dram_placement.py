@@ -4,6 +4,8 @@ from tsim_components.dram_placement import (
     SUPPORTED_DRAM_PLACEMENTS,
     build_placement_plan,
     channel_aware_placements,
+    clear_placement_cache,
+    placement_cache_info,
     record_signature,
     software_aware_placements,
 )
@@ -120,6 +122,21 @@ class DRAMPlacementTest(unittest.TestCase):
                 for placement in plan.values():
                     self.assertEqual(placement.policy, policy)
                     self.assertTrue(placement.bank_ids)
+
+    def test_placement_cache_is_keyed_by_policy_and_channel_geometry(self):
+        records = make_records()
+        clear_placement_cache()
+        build_placement_plan(records, 16, 2, "software_aware", seed=1)
+        first = placement_cache_info()
+        build_placement_plan(records, 16, 2, "software_aware", seed=1)
+        second = placement_cache_info()
+        build_placement_plan(records, 16, 4, "software_aware", seed=1)
+        build_placement_plan(records, 16, 4, "channel_aware", seed=1)
+        final = placement_cache_info()
+
+        self.assertEqual(first.misses, 1)
+        self.assertEqual(second.hits, 1)
+        self.assertEqual(final.misses, 3)
 
 
 if __name__ == "__main__":

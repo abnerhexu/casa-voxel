@@ -414,6 +414,57 @@ class DRAM:
             "transaction_bytes": self.transaction_bytes,
         }
 
+    def tiling_cache_signature(self) -> Tuple[object, ...]:
+        """Return DRAM properties that may change tiling selection.
+
+        Channel count and per-channel bandwidth are intentionally excluded:
+        a channel-count sweep reuses tiling and reruns only placement/timing.
+        Aggregate bandwidth remains in the key because bandwidth sweeps must
+        be allowed to choose a different tiling.
+        """
+        return (
+            "dram-tiling-v1",
+            float(self.total_bytes_per_cycle),
+            int(self.CL),
+            int(self.tRCD),
+            int(self.tRP),
+            int(self.bytes_per_row),
+            int(self.num_banks),
+            int(self.transaction_bytes),
+            float(self._cpb),
+            bool(self.use_sram),
+        )
+
+    def num_cycle_of_access_for_tiling(
+        self,
+        num_bytes: int,
+        access_granularity_bytes: int,
+        need_init: bool = False,
+    ) -> int:
+        """Channel-neutral analytical cost used only for tiling selection.
+
+        Final execution uses the placement-aware session.  Keeping this
+        search estimate independent of channel topology lets channel sweeps
+        reuse a previously selected tiling while aggregate-bandwidth sweeps
+        still obtain distinct cache entries.
+        """
+        if num_bytes <= 0:
+            return 0
+        if self.use_sram:
+            return int(num_bytes / 3.57)
+        granularity = max(1, int(access_granularity_bytes))
+        num_reopen = max(
+            ceil(num_bytes / granularity),
+            ceil(num_bytes / self.bytes_per_row),
+        )
+        if not need_init and num_reopen <= 1:
+            max_granularity = min(granularity, self.bytes_per_row)
+            num_reopen = num_bytes / max(1, max_granularity)
+        row_cycles = num_reopen * self.reopen * self._cpb
+        row_cycles = max(0.0, row_cycles - self.tRP)
+        transfer_cycles = ceil(num_bytes / self.total_bytes_per_cycle)
+        return int(max(1, row_cycles + transfer_cycles))
+
     def new_execution_session(
         self,
         placement_policy: str = "software_aware",
@@ -833,7 +884,8 @@ class DRAM:
                              return_cycles_bytes_granularity: bool = False,
                              return_cycles_bytes_granularity_conflicts: bool = False,
                              opti_intra_mapping: bool = False,
-                             bad_mapping: bool = False):
+                             bad_mapping: bool = False,
+                             for_tiling: bool = False):
         """Compute per-tensor DRAM access costs for a list of tensors.
 
         For each tensor the method calculates:
@@ -873,6 +925,10 @@ class DRAM:
         bad_mapping : bool, optional
             If True, simulate a sub-optimal mapping where input tensors
             use only half their last dimension for granularity.
+        for_tiling : bool, optional
+            Use the channel-neutral aggregate-bandwidth estimator. This is
+            reserved for tiling selection; final execution should leave it
+            False and use the placement-aware execution session.
         """
         dram_access_list: List[float] = []
         detailed = return_cycles_bytes_granularity or return_cycles_bytes_granularity_conflicts
@@ -923,16 +979,24 @@ class DRAM:
                 dram_access_list.append(tot_access_bytes)
             elif return_cycles_and_bytes:
                 need_init = not opti_intra_mapping
-                dram_access_cycles = self.num_cycle_of_access(tot_access_bytes,
-                                                              dram_access_granularity_byte,
-                                                              need_init)
+                cycle_fn = (
+                    self.num_cycle_of_access_for_tiling
+                    if for_tiling else self.num_cycle_of_access
+                )
+                dram_access_cycles = cycle_fn(tot_access_bytes,
+                                              dram_access_granularity_byte,
+                                              need_init)
                 dram_access_list.append(dram_access_cycles)
                 dram_bytes_list.append(tot_access_bytes)
             elif detailed:
                 need_init = not opti_intra_mapping
-                dram_access_cycles = self.num_cycle_of_access(tot_access_bytes,
-                                                              dram_access_granularity_byte,
-                                                              need_init)
+                cycle_fn = (
+                    self.num_cycle_of_access_for_tiling
+                    if for_tiling else self.num_cycle_of_access
+                )
+                dram_access_cycles = cycle_fn(tot_access_bytes,
+                                              dram_access_granularity_byte,
+                                              need_init)
                 dram_access_list.append(dram_access_cycles)
                 dram_bytes_list.append(tot_access_bytes)
                 dram_granularity_list.append(int(dram_access_granularity_byte))
@@ -946,9 +1010,13 @@ class DRAM:
                     )
             else:
                 need_init = not opti_intra_mapping
-                dram_access_cycles = self.num_cycle_of_access(tot_access_bytes,
-                                                              dram_access_granularity_byte,
-                                                              need_init)
+                cycle_fn = (
+                    self.num_cycle_of_access_for_tiling
+                    if for_tiling else self.num_cycle_of_access
+                )
+                dram_access_cycles = cycle_fn(tot_access_bytes,
+                                              dram_access_granularity_byte,
+                                              need_init)
                 dram_access_list.append(dram_access_cycles)
         if return_cycles_and_bytes:
             return dram_access_list, dram_bytes_list

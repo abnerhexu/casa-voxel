@@ -21,6 +21,7 @@ onto a 3D-stacked accelerator architecture.  Key responsibilities include:
 """
 
 from functools import lru_cache
+import hashlib
 import itertools
 from concurrent.futures import ProcessPoolExecutor as Pool, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -28,6 +29,7 @@ import numpy as np
 import os, sys
 import time
 import math
+import pickle
 import ujson as json
 
 import t10_TensorExpression as TE
@@ -469,6 +471,13 @@ class DNNProgram:
 
         self.uniform_dram_mapping: bool = False
         self.dram_placement_policy: str = "software_aware"
+        # Final tiling choices and DRAM placement plans have deliberately
+        # separate caches. This cache contains only spatial/temporal choices;
+        # placement caching lives in tsim_components.dram_placement.
+        self._tiling_selection_cache: Dict[Tuple[object, ...], object] = {}
+        self._tiling_cache_hits: int = 0
+        self._tiling_cache_misses: int = 0
+        self._tiling_candidate_fingerprints: Dict[Tuple[object, ...], Tuple[int, int, str]] = {}
         self.ipu_no_overlap: bool = False
         self.ipu_trace_tag: str = ""
         self.op_init_overhead: int = 0
@@ -500,6 +509,7 @@ class DNNProgram:
         self.op_execution_plan = []
         self.all_order_lists = []
         self._ops_cache = None  # rebuilt lazily from op_groups; avoids double-pickle
+        self._tiling_candidate_fingerprints = {}
         for op in self.ops:
             op.expr.cold_config_candidates = {}
 
@@ -1181,6 +1191,105 @@ class DNNProgram:
             if ipu:
                 op.expr.ipu = True
 
+    @staticmethod
+    def _freeze_tiling_value(value):
+        """Convert nested/numpy values into a stable, hashable cache value."""
+        if isinstance(value, np.ndarray):
+            return DNNProgram._freeze_tiling_value(value.tolist())
+        if isinstance(value, (list, tuple)):
+            return tuple(DNNProgram._freeze_tiling_value(item) for item in value)
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    def _tiling_cache_key(
+        self,
+        op: TensorOperator,
+        dram: DRAM,
+        mem_size: int,
+        core_group: int,
+    ) -> Tuple[object, ...]:
+        """Build a placement/channel-independent final-tiling cache key."""
+        fingerprint_cache = getattr(self, "_tiling_candidate_fingerprints", None)
+        if fingerprint_cache is None:
+            fingerprint_cache = {}
+            self._tiling_candidate_fingerprints = fingerprint_cache
+        base_operator_signature = (
+            int(op.op_type),
+            self._freeze_tiling_value(op.dim_lengths),
+            self._freeze_tiling_value(op.variables),
+            int(op.num_byte_per_elem),
+            self._freeze_tiling_value(op.ignore_variables),
+        )
+        cached_fingerprint = fingerprint_cache.get(base_operator_signature)
+        config_identity = id(op.expr.config_dict)
+        config_count = len(op.expr.config_dict)
+        if (
+            cached_fingerprint is not None
+            and cached_fingerprint[:2] == (config_identity, config_count)
+        ):
+            candidate_fingerprint = cached_fingerprint[2]
+        else:
+            frozen_candidates = self._freeze_tiling_value(
+                tuple(op.expr.config_dict.items())
+            )
+            candidate_fingerprint = hashlib.blake2b(
+                pickle.dumps(frozen_candidates, protocol=4), digest_size=16
+            ).hexdigest()
+            fingerprint_cache[base_operator_signature] = (
+                config_identity, config_count, candidate_fingerprint
+            )
+        operator_signature = base_operator_signature + (candidate_fingerprint,)
+        return (
+            "tiling-selection-v1",
+            operator_signature,
+            int(mem_size),
+            int(core_group),
+            int(self.tot_num_cores),
+            dram.tiling_cache_signature(),
+        )
+
+    def tiling_cache_info(self) -> Dict[str, int]:
+        """Return hit/miss/entry counts for the independent tiling cache."""
+        cache = getattr(self, "_tiling_selection_cache", {})
+        return {
+            "hits": int(getattr(self, "_tiling_cache_hits", 0)),
+            "misses": int(getattr(self, "_tiling_cache_misses", 0)),
+            "entries": len(cache),
+        }
+
+    def clear_tiling_cache(self) -> None:
+        self._tiling_selection_cache = {}
+        self._tiling_cache_hits = 0
+        self._tiling_cache_misses = 0
+        self._tiling_candidate_fingerprints = {}
+
+    def save_tiling_cache(self, path: str) -> None:
+        """Atomically persist tiling choices without any placement state."""
+        cache = getattr(self, "_tiling_selection_cache", {})
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{path}.tmp-{os.getpid()}"
+        with open(tmp_path, "wb") as handle:
+            pickle.dump({"version": 1, "entries": cache}, handle)
+        os.replace(tmp_path, path)
+
+    def load_tiling_cache(self, path: str, merge: bool = True) -> int:
+        """Load a cache created by :meth:`save_tiling_cache`."""
+        with open(path, "rb") as handle:
+            payload = pickle.load(handle)
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError(f"unsupported tiling cache format in {path}")
+        entries = payload.get("entries")
+        if not isinstance(entries, dict):
+            raise ValueError(f"invalid tiling cache entries in {path}")
+        if not merge:
+            self.clear_tiling_cache()
+        cache = getattr(self, "_tiling_selection_cache", {})
+        cache.update(entries)
+        self._tiling_selection_cache = cache
+        return len(entries)
+
     def get_best_config_by_max_mem_size(self, op: TensorOperator, dram: DRAM, mem_size: int, core_group: int) -> Tuple[List[int], List[List[int]]]:
         """Select the best (spatial, temporal) config that fits in *mem_size*.
 
@@ -1200,6 +1309,19 @@ class DNNProgram:
             The ``(spatial, temporal)`` configuration tuple with the lowest
             weighted execution cost.
         """
+        cache = getattr(self, "_tiling_selection_cache", None)
+        if cache is None:
+            # Backward compatibility for program pickles created before the
+            # tiling/placement cache split.
+            self.clear_tiling_cache()
+            cache = self._tiling_selection_cache
+        cache_key = self._tiling_cache_key(op, dram, mem_size, core_group)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            self._tiling_cache_hits = getattr(self, "_tiling_cache_hits", 0) + 1
+            return cached
+
+        self._tiling_cache_misses = getattr(self, "_tiling_cache_misses", 0) + 1
         last_config = ()
         last_time = float("inf")
         weight = 2
@@ -1208,7 +1330,9 @@ class DNNProgram:
                 break
             spatial, temporal = config
             config_it = iter([(temporal, spatial)])
-            dram_times = self.get_dram_time([op], dram, core_group, config_it)
+            dram_times = self.get_dram_time(
+                [op], dram, core_group, config_it, for_tiling=True
+            )
             dram_time = dram_times[0]
             # Weighted power-mean: penalises compute/DRAM imbalance
             tot = exe_time**weight + dram_time**weight
@@ -1218,6 +1342,7 @@ class DNNProgram:
                 last_config = config
 
         assert last_config != (), f"op {op.name} has no valid config for mem size {mem_size}"
+        cache[cache_key] = last_config
         return last_config
 
 
@@ -1234,7 +1359,8 @@ class DNNProgram:
     #   t_finish       : end of execution
     # -----------------------------------------------------------------------
 
-    def get_dram_time(self, fused_op: List[TensorOperator], dram: DRAM, core_group_size, partition_it):
+    def get_dram_time(self, fused_op: List[TensorOperator], dram: DRAM, core_group_size, partition_it,
+                      for_tiling: bool = False):
         """Compute DRAM read/write cycles and bytes for a fused operator.
 
         For each sub-operator in the fused group:
@@ -1288,7 +1414,10 @@ class DNNProgram:
                                         core_group_size,
                                         op.expr.num_byte_per_elem,
                                         return_cycles_bytes_granularity_conflicts=True,
-                                        bad_mapping=self.uniform_dram_mapping,
+                                        # Physical placement must not alter
+                                        # tensor tiling or access granularity.
+                                        bad_mapping=False,
+                                        for_tiling=for_tiling,
                                         )
             ignore_list = op.expr.ignore_variables
             # access_list[0] is the output; access_list[1:] are inputs.

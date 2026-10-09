@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from functools import lru_cache
 from math import ceil, floor
 from typing import Dict, Iterable, Mapping, Sequence, Tuple
 
@@ -211,7 +212,7 @@ def channel_aware_placements(
     return result
 
 
-def build_placement_plan(
+def _build_placement_plan_uncached(
     records: Iterable[Mapping[str, object]],
     total_banks: int,
     num_channels: int,
@@ -278,3 +279,82 @@ def build_placement_plan(
             channel_ids=tuple(sorted({bank % num_channels for bank in banks})),
         )
     return result
+
+
+@lru_cache(maxsize=8192)
+def _cached_placement_plan(
+    record_specs: Tuple[Tuple[RecordSignature, int, object], ...],
+    total_banks: int,
+    num_channels: int,
+    policy: str,
+    seed: int,
+    stripe_bytes: int,
+) -> Tuple[Tuple[RecordSignature, TensorPlacement], ...]:
+    records = []
+    for signature, size, address in record_specs:
+        subop_index, tensor_index, tensor_role, stage = signature
+        record = {
+            "subop_index": subop_index,
+            "tensor_index": tensor_index,
+            "tensor_role": tensor_role,
+            "stage": stage,
+            "total_bytes": size,
+        }
+        if address is not None:
+            record["address"] = address
+        records.append(record)
+    plan = _build_placement_plan_uncached(
+        records,
+        total_banks=total_banks,
+        num_channels=num_channels,
+        policy=policy,
+        seed=seed,
+        stripe_bytes=stripe_bytes,
+    )
+    return tuple(sorted(plan.items()))
+
+
+def build_placement_plan(
+    records: Iterable[Mapping[str, object]],
+    total_banks: int,
+    num_channels: int,
+    policy: str,
+    seed: int = 0,
+    stripe_bytes: int = 128,
+) -> Dict[RecordSignature, TensorPlacement]:
+    """Return a placement plan from the placement-only LRU cache.
+
+    The cache key contains tensor access descriptors, policy, and complete
+    channel/bank geometry. It contains no tiling-selection state; changing
+    channel count or policy therefore recomputes placement without evicting
+    or invalidating the independent tiling cache.
+    """
+    normalized_policy = str(policy).lower().replace("-", "_")
+    record_specs = tuple(sorted(
+        (
+            record_signature(record),
+            record_bytes(record),
+            int(record["address"]) if record.get("address") is not None else None,
+        )
+        for record in records
+        if record_bytes(record) > 0
+    ))
+    cached = _cached_placement_plan(
+        record_specs,
+        max(1, int(total_banks)),
+        max(1, int(num_channels)),
+        normalized_policy,
+        int(seed),
+        max(1, int(stripe_bytes)),
+    )
+    return dict(cached)
+
+
+def placement_cache_info():
+    """Expose placement-cache statistics for experiment diagnostics."""
+    return _cached_placement_plan.cache_info()
+
+
+def clear_placement_cache() -> None:
+    """Clear only placement plans; tiling selections are unaffected."""
+    _cached_placement_plan.cache_clear()
