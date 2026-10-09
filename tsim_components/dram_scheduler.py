@@ -8,7 +8,9 @@ large tensors into one Python object per DRAM transaction.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
+import hashlib
+import json
 from math import ceil
 from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
@@ -21,6 +23,7 @@ from tsim_components.dram_placement import (
     record_bytes,
     requester_core_weights,
     record_signature,
+    TensorPlacement,
 )
 from tsim_components.noc import (
     ALL_INIT_CYCLES,
@@ -57,6 +60,8 @@ class DRAMStageStats:
     noc_max_link_bytes: float = 0.0
     noc_max_hops: int = 0
     noc_flow_count: int = 0
+    resource: dict = field(default_factory=dict)
+    trace: list = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, int]:
         return {
@@ -71,6 +76,8 @@ class DRAMStageStats:
             "noc_max_link_bytes": float(self.noc_max_link_bytes),
             "noc_max_hops": int(self.noc_max_hops),
             "noc_flow_count": int(self.noc_flow_count),
+            **({"resource": self.resource} if self.resource else {}),
+            **({"trace": self.trace} if self.trace else {}),
         }
 
 
@@ -300,12 +307,23 @@ class DRAMExecutionSession:
         replication_factor: int = 1,
         frfcfs_window: int = 32,
         noc=None,
+        seed: int = 0,
+        instrument: bool = False,
+        trace: bool = False,
+        frozen: dict | None = None,
+        observer=None,
     ) -> None:
         self.dram = dram
         self.placement_policy = str(placement_policy).lower().replace("-", "_")
         self.replication_factor = max(1, int(replication_factor))
         self.frfcfs_window = max(1, int(frfcfs_window))
         self.noc = noc
+        self.seed = int(seed)
+        self.instrument = instrument or trace
+        self.trace_enabled = trace
+        self.frozen = frozen
+        self.observer = observer
+        self.snapshot = {"version": 1, "operations": {}}
         self._open_rows = [-1] * int(dram.geometry.total_banks)
         self._placement_plan = None
         self._tensor_addresses: Dict[object, int] = {}
@@ -327,6 +345,13 @@ class DRAMExecutionSession:
         if self._placement_plan is None:
             self.prepare_records(records)
         plan = self._placement_plan
+        if self.frozen is not None:
+            saved = self.frozen["operations"][str(op_index)]
+            if saved["logical_hash"] != self.logical_hash(records):
+                raise ValueError("frozen replay logical access mismatch")
+            return [DRAMRowRun(**{
+                **run, "channel_id": geometry.decode_bank(run["bank_id"])[0]
+            }) for run in saved["runs"]], plan
         missing = {
             record_signature(record) for record in records
             if record_bytes(record) > 0
@@ -400,6 +425,32 @@ class DRAMExecutionSession:
         plan is then shared by every fused operator in this execution session.
         """
         geometry = self.dram.geometry
+        geometry_key = {
+            "banks": int(geometry.total_banks),
+            "row_bytes": int(geometry.bytes_per_row),
+            "transaction_bytes": int(geometry.transaction_bytes),
+        }
+        self.snapshot.update(geometry=geometry_key,
+                             logical_hash=self.logical_hash(access_records))
+        if self.frozen is not None:
+            if (self.frozen["geometry"] != geometry_key or
+                    self.frozen["logical_hash"] != self.snapshot["logical_hash"]):
+                raise ValueError("frozen replay geometry/logical input mismatch")
+            self._placement_plan = {}
+            for entry in self.frozen["allocations"]:
+                signature = record_signature(entry["record"])
+                banks = tuple(entry["bank_ids"])
+                if not banks or any(b < 0 or b >= geometry.total_banks for b in banks):
+                    raise ValueError("invalid frozen bank IDs")
+                self._placement_plan[signature] = TensorPlacement(
+                    self.placement_policy, banks,
+                    tuple(sorted({geometry.decode_bank(b)[0] for b in banks})))
+                self._tensor_addresses[signature] = int(entry["address"])
+                capacity = getattr(self.dram, "capacity_bytes", None)
+                if capacity is not None and entry["address"] + allocation_bytes(entry["record"]) > capacity:
+                    raise ValueError("frozen allocation exceeds capacity")
+            self.snapshot["allocations"] = self.frozen["allocations"]
+            return
         by_signature: Dict[object, dict] = {}
         requester_demands: Dict[object, Dict[int, float]] = {}
         for source in access_records:
@@ -467,10 +518,19 @@ class DRAMExecutionSession:
             geometry.total_banks,
             geometry.num_channels,
             self.placement_policy,
-            seed=0,
+            seed=self.seed,
             stripe_bytes=geometry.transaction_bytes,
             noc=self.noc,
         )
+        self.snapshot["allocations"] = [{
+            "record": record, "address": self._tensor_addresses[record_signature(record)],
+            "bank_ids": list(self._placement_plan[record_signature(record)].bank_ids),
+        } for record in self._prepared_records]
+
+    @staticmethod
+    def logical_hash(records):
+        return hashlib.sha256(json.dumps(list(records), sort_keys=True,
+                                        separators=(",", ":")).encode()).hexdigest()
 
     def _schedule_stage(
         self,
@@ -492,6 +552,7 @@ class DRAMExecutionSession:
         record_start: Dict[int, int] = {}
         record_finish: Dict[int, int] = {}
         record_counts: Dict[int, List[int]] = {}
+        events = []
 
         while pending:
             # Bounded FR-FCFS approximation.  First choose the request that
@@ -546,6 +607,12 @@ class DRAMExecutionSession:
             )
             transfer_start = max(row_ready, channel_free[run.channel_id])
             finish = transfer_start + transfer_cycles
+            if self.instrument:
+                events.append({**asdict(run), "input_index": runs.index(run),
+                               "release": 0, "bank_start": bank_free[run.bank_id],
+                               "row_ready": row_ready, "transfer_start": transfer_start,
+                               "finish": finish, "hits": hits, "misses": misses,
+                               "conflicts": conflicts})
             bank_free[run.bank_id] = finish
             channel_free[run.channel_id] = finish
             self._open_rows[run.bank_id] = run.row_start + run.row_count - 1
@@ -565,6 +632,29 @@ class DRAMExecutionSession:
             counts[2] += conflicts
 
         stats.cycles = max(channel_free, default=0)
+        if self.instrument:
+            channels = len(channel_free)
+            busy = [0] * channels
+            channel_bytes = [0] * channels
+            bank_bytes = [0] * len(bank_free)
+            for event in events:
+                c = event["channel_id"]
+                busy[c] += event["finish"] - event["transfer_start"]
+                channel_bytes[c] += event["num_bytes"]
+                bank_bytes[event["bank_id"]] += event["num_bytes"]
+            # Idle causes cannot be inferred from bus gaps alone. Keep them
+            # explicitly unclassified, rather than inventing timing stalls.
+            tail = sum(stats.cycles - end for end in channel_free)
+            stats.resource = {
+                "channel_bytes": channel_bytes, "bank_bytes": bank_bytes,
+                "channel_busy_cycles": busy, "channel_finish": channel_free,
+                "channel_time": channels * stats.cycles,
+                "transfer": sum(busy), "tail_idle": tail,
+                "unclassified_idle": channels * stats.cycles - sum(busy) - tail,
+                "bank_busy_integral": sum(e["finish"] - e["bank_start"] for e in events),
+            }
+            if self.trace_enabled:
+                stats.trace = events
         for record_index, counts in record_counts.items():
             record = records[record_index]
             record["row_hits"] = int(counts[0])
@@ -583,6 +673,11 @@ class DRAMExecutionSession:
         """Place and schedule one fused operator's selected DRAM accesses."""
         records = [dict(record) for record in access_records]
         runs, plan = self._row_runs(records, op_index)
+        self.snapshot["operations"][str(op_index)] = {
+            "logical_hash": self.logical_hash(access_records),
+            "records": [dict(r) for r in access_records],
+            "runs": [asdict(run) for run in runs],
+        }
         for record in records:
             signature = record_signature(record)
             placement = plan.get(signature)
@@ -623,4 +718,7 @@ class DRAMExecutionSession:
             noc=self.noc,
             num_channels=int(self.dram.geometry.num_channels),
         )
-        return DRAMScheduleResult(read=read, write=write, records=records)
+        result = DRAMScheduleResult(read=read, write=write, records=records)
+        if self.observer is not None:
+            self.observer(self, op_index, result)
+        return result

@@ -524,6 +524,7 @@ class DRAM:
                 else int(getattr(self, "frfcfs_window", 32))
             ),
             noc=noc,
+            **getattr(self, "execution_options", {}),
         )
 
     def _populate_from_dram_cache(self) -> None:
