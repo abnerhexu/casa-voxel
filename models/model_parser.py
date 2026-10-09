@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 import numpy as np
 import ujson as json
 import sys
@@ -605,6 +606,11 @@ if len(sys.argv) > 4:
 
 if len(sys.argv) > 5:
     KV_CACHE_SEQ_LEN = int(sys.argv[5])
+
+# Git does not preserve empty output directories, so a fresh clone may not
+# contain these paths yet.  Create them before the parser emits either file.
+Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
+Path(texpre_filename).parent.mkdir(parents=True, exist_ok=True)
 
 ops = parse_model(f"original/{model_filename}")
 ops_id_dict: Dict[int, Operator] = {op.id: op for op in ops}
