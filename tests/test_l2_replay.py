@@ -75,3 +75,22 @@ class FrozenReplayTest(unittest.TestCase):
         session = dram.new_execution_session(placement_policy="stage_aware_no_distance")
         out = session.schedule_records(records, 0)
         self.assertEqual(out.read.num_bytes + out.write.num_bytes, 2048)
+
+    def test_counterfactuals_remove_only_requested_time(self):
+        records = [record("read", 1, 1024)]
+        baseline = self.session(make_dram()).schedule_records(records, 0).read
+        row = self.session(make_dram(), counterfactual="ideal_row_switch").schedule_records(records, 0).read
+        ideal = self.session(make_dram(), counterfactual="ideal_dram").schedule_records(records, 0).read
+        self.assertEqual(row.cycles, 4*14 + 32)
+        self.assertEqual(ideal.dram_cycles, 0)
+        self.assertEqual(ideal.row_conflicts, baseline.row_conflicts)
+        self.assertEqual(ideal.num_bytes, baseline.num_bytes)
+
+    def test_analytical_estimates_are_not_logical_identity(self):
+        records = [record("read", 1, 1024)]
+        records[0].update(cycles_per_core=100, scheduled_cycles=100, total_row_conflicts=2)
+        original = self.session(make_dram())
+        original.schedule_records(records, 0)
+        records[0].update(cycles_per_core=200, scheduled_cycles=200, total_row_conflicts=4)
+        replay = self.session(make_dram(bytepc=64), frozen=original.snapshot)
+        self.assertEqual(replay.schedule_records(records, 0).read.num_bytes, 1024)

@@ -316,6 +316,8 @@ class DRAMExecutionSession:
         row_budget: int | None = None,
         max_bypass: int = 32,
         fixed_bank_order: bool = False,
+        counterfactual: str = "none",
+        counterfactual_op_indices=None,
     ) -> None:
         self.dram = dram
         self.placement_policy = str(placement_policy).lower().replace("-", "_")
@@ -337,6 +339,11 @@ class DRAMExecutionSession:
         self.row_budget = row_budget
         self.max_bypass = max_bypass
         self.fixed_bank_order = fixed_bank_order
+        if counterfactual not in ("none", "ideal_row_switch", "ideal_dram_noc", "ideal_dram"):
+            raise ValueError("unknown counterfactual")
+        self.counterfactual = counterfactual
+        self.requested_counterfactual = counterfactual
+        self.counterfactual_op_indices = counterfactual_op_indices
         self.snapshot = {"version": 1, "operations": {}}
         self._open_rows = [-1] * int(dram.geometry.total_banks)
         self._placement_plan = None
@@ -543,13 +550,21 @@ class DRAMExecutionSession:
                 use_load=self.placement_policy != "stage_aware_no_load",
                 use_distance=self.placement_policy != "stage_aware_no_distance")
         self.snapshot["allocations"] = [{
-            "record": record, "address": self._tensor_addresses[record_signature(record)],
+            "record": self.logical_record(record), "address": self._tensor_addresses[record_signature(record)],
             "bank_ids": list(self._placement_plan[record_signature(record)].bank_ids),
         } for record in self._prepared_records]
 
     @staticmethod
-    def logical_hash(records):
-        return hashlib.sha256(json.dumps(list(records), sort_keys=True,
+    def logical_record(record):
+        # get_dram_time also emits preliminary analytical timing/conflicts.
+        # Those are outputs of hardware, not part of the fixed access demand.
+        outputs = {"cycles_per_core", "scheduled_cycles", "row_conflicts_per_core",
+                   "total_row_conflicts", "row_hits", "row_misses", "source"}
+        return {k: v for k, v in record.items() if k not in outputs}
+
+    @classmethod
+    def logical_hash(cls, records):
+        return hashlib.sha256(json.dumps([cls.logical_record(r) for r in records], sort_keys=True,
                                         separators=(",", ":")).encode()).hexdigest()
 
     def _schedule_stage(
@@ -604,6 +619,10 @@ class DRAMExecutionSession:
                     + candidate_conflicts
                     * (int(self.dram.tRP) + int(self.dram.tRCD))
                 )
+                if self.counterfactual == "ideal_row_switch":
+                    candidate_row_cycles = candidate_run.row_count * int(self.dram.CL)
+                elif self.counterfactual == "ideal_dram":
+                    candidate_row_cycles = 0
                 ready = max(
                     bank_free[candidate_run.bank_id] + candidate_row_cycles,
                     channel_free[candidate_run.channel_id],
@@ -657,6 +676,11 @@ class DRAMExecutionSession:
             transfer_cycles = max(
                 1, int(ceil(run.num_bytes / self._chip_channel_bytes_per_cycle))
             )
+            if self.counterfactual == "ideal_row_switch":
+                row_ready = bank_free[run.bank_id] + run.row_count * int(self.dram.CL)
+            elif self.counterfactual == "ideal_dram":
+                row_ready = bank_free[run.bank_id]
+                transfer_cycles = 0
             transfer_start = max(row_ready, channel_free[run.channel_id])
             finish = transfer_start + transfer_cycles
             if self.instrument:
@@ -740,10 +764,13 @@ class DRAMExecutionSession:
     ) -> DRAMScheduleResult:
         """Place and schedule one fused operator's selected DRAM accesses."""
         records = [dict(record) for record in access_records]
+        self.counterfactual = (self.requested_counterfactual
+                              if self.counterfactual_op_indices is None or op_index in self.counterfactual_op_indices
+                              else "none")
         runs, plan = self._row_runs(records, op_index)
         self.snapshot["operations"][str(op_index)] = {
             "logical_hash": self.logical_hash(access_records),
-            "records": [dict(r) for r in access_records],
+            "records": [self.logical_record(r) for r in access_records],
             "runs": [asdict(run) for run in runs],
         }
         for record in records:
@@ -786,6 +813,13 @@ class DRAMExecutionSession:
             noc=self.noc,
             num_channels=int(self.dram.geometry.num_channels),
         )
+        if self.counterfactual == "ideal_dram_noc":
+            # Remove only time. Physical traffic/energy remain accounted for.
+            for stats in (read, write):
+                stats.noc_cycles = 0
+                stats.cycles = stats.dram_cycles
+            for record in records:
+                record["dram_noc_cycles"] = 0
         result = DRAMScheduleResult(read=read, write=write, records=records)
         if self.observer is not None:
             self.observer(self, op_index, result)
