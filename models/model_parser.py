@@ -4,8 +4,10 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import numpy as np
 import ujson as json
+import os
 import sys
 import re
+import tempfile
 from math import ceil
 
 # Helper function to create a shallow copy of operator data with list copies
@@ -607,17 +609,22 @@ if len(sys.argv) > 4:
 if len(sys.argv) > 5 and not sys.argv[5].startswith("--"):
     KV_CACHE_SEQ_LEN = int(sys.argv[5])
 
-def get_optional_int_arg(flag: str) -> Optional[int]:
+def get_optional_arg(flag: str) -> Optional[str]:
     if flag not in sys.argv:
         return None
     idx = sys.argv.index(flag)
     if idx + 1 >= len(sys.argv):
         raise ValueError(f"missing value for {flag}")
-    return int(sys.argv[idx + 1])
+    return sys.argv[idx + 1]
+
+def get_optional_int_arg(flag: str) -> Optional[int]:
+    value = get_optional_arg(flag)
+    return None if value is None else int(value)
 
 source_total_layers = get_optional_int_arg("--total-layers")
 motif_start_layer = get_optional_int_arg("--motif-start-layer")
 motif_layers = get_optional_int_arg("--motif-layers")
+artifact_tag = get_optional_arg("--artifact-tag")
 motif_args = (source_total_layers, motif_start_layer, motif_layers)
 if any(value is not None for value in motif_args):
     if any(value is None for value in motif_args):
@@ -641,10 +648,40 @@ if any(value is not None for value in motif_args):
     else:
         texpre_filename = f"TExpr/TExpr_{model_filename[:-5]}{motif_tag}.json"
 
+if artifact_tag is not None:
+    if not re.fullmatch(r"[A-Za-z0-9._+-]+", artifact_tag):
+        raise ValueError(
+            "--artifact-tag may contain only letters, digits, '.', '_', '+', and '-'"
+        )
+    output_filename = f"parsed/parsed_{artifact_tag}.json"
+    texpre_filename = f"TExpr/TExpr_{artifact_tag}.json"
+
 # Git does not preserve empty output directories, so a fresh clone may not
 # contain these paths yet.  Create them before the parser emits either file.
 Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
 Path(texpre_filename).parent.mkdir(parents=True, exist_ok=True)
+
+def atomic_json_dump(value, filename: str) -> None:
+    """Publish JSON atomically, including on a shared NFS directory."""
+    target = Path(filename)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(value, handle, indent=4)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 ops = parse_model(f"original/{model_filename}")
 if source_total_layers is not None:
@@ -783,8 +820,7 @@ if SINGLE_IPU:
                 else:
                     op.should_ignore_inputs[idx] = True
 
-with open(output_filename, 'w') as f:
-    json.dump([op.dump_as_list() for op in ops], f, indent=4)
+atomic_json_dump([op.dump_as_list() for op in ops], output_filename)
 
 json_dump_list = [get_tensor_expr_info_from_op(op) for op in ops]
 if model_filename == "retnet.json":
@@ -873,8 +909,7 @@ while not partition_ready:
         else:
             finished_idx = i
 
-with open(texpre_filename, 'w') as f:
-    json.dump(json_dump_list, f, indent=4)
+atomic_json_dump(json_dump_list, texpre_filename)
 
 
 
