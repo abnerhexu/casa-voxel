@@ -233,6 +233,14 @@ external precise timing modes use a synthesized, bank-striped request stream,
 so these conflict counts reflect VOXEL's mapping model rather than a captured
 physical command trace.
 
+DRAM configurations may describe physical geometry explicitly with
+`num_layers`, `banks_per_layer`, `num_channels`, `bytes_per_row`, and
+`transaction_bytes`. The default geometry is 8 layers x 16 banks (128 banks),
+one logical channel, and 128-byte transactions. `DRAMGeometry` validates that
+the total bank count is evenly divisible by the channel count and provides a
+single bank numbering scheme shared by timing, conflict, and placement code.
+Older configurations containing only `num_banks_per_channel` remain accepted.
+
 ### 3.4 Generate Figures (Figs 10–20)
 
 Once simulation data is ready (verify with the dry-run in Section 3.3), each

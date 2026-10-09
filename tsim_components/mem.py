@@ -17,11 +17,12 @@ Key abstractions
 
 import sys
 import numpy as np
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union, Set
 from math import ceil
 
-# Total number of DRAM banks shared across all cores.
-# Used to compute per-bank contention (cores_per_bank = num_cores / NUM_BANKS).
+# Legacy default number of DRAM banks shared across all cores. New code uses
+# ``DRAMGeometry.total_banks``; the constant remains part of the public API.
 NUM_BANKS = 128
 
 # Default DRAM timing parameters shared across the codebase.
@@ -35,6 +36,67 @@ HBM_PACKAGE_CAPACITY_MB = 16 * 1024
 
 HBM_PACKAGE_AREA_MM2 = 87.62745402745404
 """Default HBM package footprint area in mm^2 from the TSIM area model."""
+
+
+@dataclass(frozen=True)
+class DRAMGeometry:
+    """Physical DRAM geometry shared by placement and timing models.
+
+    Banks are numbered first by layer and then within a layer. Channels are
+    assigned by interleaving global bank IDs, which keeps every channel's bank
+    count equal while distributing each layer across channels. Transaction
+    size is intentionally independent from sustained controller bandwidth.
+    """
+
+    num_layers: int = 8
+    banks_per_layer: int = 16
+    num_channels: int = 1
+    bytes_per_row: int = 8192
+    transaction_bytes: int = 128
+
+    def __post_init__(self) -> None:
+        for name in (
+            "num_layers", "banks_per_layer", "num_channels",
+            "bytes_per_row", "transaction_bytes",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.total_banks % int(self.num_channels):
+            raise ValueError(
+                f"total_banks ({self.total_banks}) must be divisible by "
+                f"num_channels ({self.num_channels})"
+            )
+
+    @property
+    def total_banks(self) -> int:
+        return int(self.num_layers) * int(self.banks_per_layer)
+
+    @property
+    def banks_per_channel(self) -> int:
+        return self.total_banks // int(self.num_channels)
+
+    def decode_bank(self, global_bank_id: int) -> Tuple[int, int, int, int]:
+        """Return ``(channel, bank_in_channel, layer, bank_in_layer)``."""
+        bank = int(global_bank_id)
+        if not 0 <= bank < self.total_banks:
+            raise ValueError(
+                f"global_bank_id {bank} outside [0, {self.total_banks})"
+            )
+        layer, bank_in_layer = divmod(bank, int(self.banks_per_layer))
+        channel = bank % int(self.num_channels)
+        bank_in_channel = bank // int(self.num_channels)
+        return channel, bank_in_channel, layer, bank_in_layer
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "num_layers": int(self.num_layers),
+            "banks_per_layer": int(self.banks_per_layer),
+            "total_banks": self.total_banks,
+            "num_channels": int(self.num_channels),
+            "banks_per_channel": self.banks_per_channel,
+            "bytes_per_row": int(self.bytes_per_row),
+            "transaction_bytes": int(self.transaction_bytes),
+        }
 
 def get_hbm_package_count(
     dram_size_MB: int,
@@ -222,7 +284,11 @@ class DRAM:
                  num_layers: int = 8,
                  use_sram: bool = False,
                  precise: bool = False,
-                 num_banks_per_channel: int = 16,
+                 num_banks_per_channel: Optional[int] = None,
+                 banks_per_layer: int = 16,
+                 num_channels: int = 1,
+                 transaction_bytes: int = 128,
+                 geometry: Optional[DRAMGeometry] = None,
                  tRRD: int = 4,
                  tFAW: int = 20,
                  tRFC: int = 350,
@@ -239,10 +305,50 @@ class DRAM:
         self.tRP: int = tRP
         # Full row-reopen penalty: activate + column-access + precharge.
         self.reopen: int = CL + tRCD + tRP
-        self.bytes_per_row: int = bytes_per_row
+        # ``num_banks_per_channel`` is a legacy constructor argument. When it
+        # is explicitly supplied without a geometry, preserve its historical
+        # single-channel meaning while representing it through DRAMGeometry.
+        if geometry is None:
+            if num_banks_per_channel is not None:
+                legacy_total_banks = int(num_banks_per_channel) * int(num_channels)
+                if legacy_total_banks % int(num_layers) == 0:
+                    legacy_layers = int(num_layers)
+                    legacy_banks_per_layer = legacy_total_banks // legacy_layers
+                else:
+                    legacy_layers = 1
+                    legacy_banks_per_layer = legacy_total_banks
+                geometry = DRAMGeometry(
+                    num_layers=legacy_layers,
+                    banks_per_layer=legacy_banks_per_layer,
+                    num_channels=int(num_channels),
+                    bytes_per_row=int(bytes_per_row),
+                    transaction_bytes=int(transaction_bytes),
+                )
+            else:
+                geometry = DRAMGeometry(
+                    num_layers=int(num_layers),
+                    banks_per_layer=int(banks_per_layer),
+                    num_channels=int(num_channels),
+                    bytes_per_row=int(bytes_per_row),
+                    transaction_bytes=int(transaction_bytes),
+                )
+        elif int(bytes_per_row) != int(geometry.bytes_per_row):
+            raise ValueError(
+                "bytes_per_row disagrees with geometry.bytes_per_row: "
+                f"{bytes_per_row} != {geometry.bytes_per_row}"
+            )
+
+        self.geometry: DRAMGeometry = geometry
+        self.bytes_per_row: int = int(geometry.bytes_per_row)
         self.bytes_per_cycle: int = bytes_per_cycle
         self.num_cores: int = num_cores
-        self.num_layers: int = num_layers
+        self.num_layers: int = int(geometry.num_layers)
+        self.banks_per_layer: int = int(geometry.banks_per_layer)
+        self.num_channels: int = int(geometry.num_channels)
+        self.num_banks: int = int(geometry.total_banks)
+        # Compatibility attribute used by callers that inspect the old name.
+        self.num_banks_per_channel: int = int(geometry.banks_per_channel)
+        self.transaction_bytes: int = int(geometry.transaction_bytes)
         self.use_sram: bool = use_sram
         # Switch: when non-zero, lock cores_per_bank to this fixed value
         # (e.g. 2 = pin to the default 256-core / 128-bank ratio) instead of
@@ -264,7 +370,6 @@ class DRAM:
         # Defaults are off — when ``precise=False`` the original analytical
         # fast path is used unchanged.
         self.precise: bool = precise
-        self.num_banks_per_channel: int = num_banks_per_channel
         self.tRRD: int = tRRD
         self.tFAW: int = tFAW
         self.tRFC: int = tRFC
@@ -331,8 +436,8 @@ class DRAM:
         if self.lock_cores_per_bank:
             return float(self.lock_cores_per_bank)
         if self.soft_cores_per_bank:
-            return (self.num_cores/NUM_BANKS)**.8
-        return 2
+            return max(1.0, (self.num_cores / self.num_banks) ** .8)
+        return max(1.0, self.num_cores / self.num_banks)
 
     def _cores_per_bank(self) -> float:
         """Return the cached cores-per-bank value (computed in __init__).
@@ -449,7 +554,7 @@ class DRAM:
         bursts_per_chunk = max(1, granularity // bytes_per_burst)
         num_bursts = (int(num_bytes) + bytes_per_burst - 1) // bytes_per_burst
         num_chunks = (num_bursts + bursts_per_chunk - 1) // bursts_per_chunk
-        num_banks = max(1, int(self.num_banks_per_channel))
+        num_banks = max(1, int(self.num_banks))
         return max(0, num_chunks - num_banks)
 
     def _precise_num_cycle_of_access(self,
@@ -527,7 +632,7 @@ class DRAM:
         num_bursts = max(1, (int(num_bytes) + bpc - 1) // bpc)
         num_chunks = (num_bursts + bursts_per_chunk - 1) // bursts_per_chunk
 
-        NB = max(1, self.num_banks_per_channel)
+        NB = max(1, self.num_banks)
         # Bank state: open row id (-1 = closed) and earliest free time.
         bank_open_row: List[int] = [-1] * NB
         bank_free_time: List[int] = [0] * NB

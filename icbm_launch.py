@@ -124,16 +124,36 @@ def get_hw_modules( hw_config, num_cores,
     dram_info = hw_config["dram"]
     per_cycle_bytes_per_core = get_per_cycle_bytes_per_core_from_DRAM_config(num_cores,
                                     dram_info["bandwidth_GBps"], dram_info["npu_freq_MHz"])
-    # Row size seen by each core = single-cycle bandwidth * accesses per row.
-    row_bytes_per_core = per_cycle_bytes_per_core * dram_info["num_access_per_row"]
+    # New configurations specify a physical row size directly. Retain the
+    # legacy accesses-per-row conversion for older generated JSON files.
+    if "bytes_per_row" in dram_info:
+        row_bytes_per_core = int(dram_info["bytes_per_row"])
+    else:
+        row_bytes_per_core = (
+            per_cycle_bytes_per_core * dram_info["num_access_per_row"]
+        )
     # Optional precise-mode timing parameters (fall back to defaults when
     # the hw_config JSON omits them, so existing configs keep working).
     dram_kwargs = {}
     if precise_dram or ultra_precise_dram:
         dram_kwargs["precise"] = True
-        for opt_key in ("num_banks_per_channel", "tRRD", "tFAW", "tRFC", "tREFI"):
+        for opt_key in ("tRRD", "tFAW", "tRFC", "tREFI"):
             if opt_key in dram_info:
                 dram_kwargs[opt_key] = dram_info[opt_key]
+
+    geometry_kwargs = {
+        "num_layers": int(dram_info.get("num_layers", 8)),
+        "banks_per_layer": int(dram_info.get("banks_per_layer", 16)),
+        "num_channels": int(dram_info.get("num_channels", 1)),
+        "transaction_bytes": int(dram_info.get("transaction_bytes", 128)),
+    }
+    # Preserve old configs which used one isolated bank-count parameter.
+    if "num_banks_per_channel" in dram_info and not any(
+        key in dram_info for key in ("banks_per_layer", "num_channels")
+    ):
+        geometry_kwargs["num_banks_per_channel"] = int(
+            dram_info["num_banks_per_channel"]
+        )
 
     # Try to bring up an external cycle-accurate DRAM simulator. On any
     # failure we *do not* silently degrade — a clear warning is printed and
@@ -167,6 +187,7 @@ def get_hw_modules( hw_config, num_cores,
                 use_sram=use_sram,
                 lock_cores_per_bank=lock_cores_per_bank,
                 soft_cores_per_bank=soft_cores_per_bank,
+                **geometry_kwargs,
                 **dram_kwargs)
 
     # --- NoC (Network-on-Chip) module ---

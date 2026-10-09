@@ -261,6 +261,10 @@ def make_config(
             "bandwidth_GBps": bandwidth_GBps,
             "num_access_per_row": num_access_per_row,
             "npu_freq_MHz": npu_freq_MHz,
+            "num_layers": 8,
+            "banks_per_layer": 16,
+            "num_channels": 1,
+            "transaction_bytes": 128,
         },
     }
 
