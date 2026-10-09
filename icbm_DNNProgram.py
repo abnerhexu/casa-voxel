@@ -222,11 +222,20 @@ def _get_compile_thread_cap() -> int:
     """Return the process-wide compilation thread cap.
 
     Controlled by the ``ICBM_COMPILE_THREADS`` environment variable.
-    Falls back to ``os.cpu_count()`` (or 8) when the variable is unset.
+    Falls back to the current CPU affinity (or ``os.cpu_count()``) when the
+    variable is unset, so schedulers such as Slurm can constrain the process.
     """
+    configured = os.environ.get("ICBM_COMPILE_THREADS")
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError as exc:
+            raise ValueError(
+                "ICBM_COMPILE_THREADS must be a positive integer"
+            ) from exc
     try:
-        return max(1, int(os.environ.get("ICBM_COMPILE_THREADS", "")))
-    except ValueError:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
         return os.cpu_count() or 8
 
 
@@ -301,19 +310,25 @@ def _compile_single_op_cold_hot(
 
 def _classify_and_setup_ops(
     exprs: List[TensorExpression],
-    is_intra_mode: bool
-) -> Tuple[List[int], List[int], int, int, int, List[Tuple[int, List[int], float, int]], int, int, float]:
+    is_intra_mode: bool,
+    num_threads: int,
+) -> Tuple[List[int], List[int], int, int, int, List[Tuple[int, List[int], float, int]], int, int, float, int]:
     """Classify operators into heavy/light and compute resource allocation.
 
     Args:
         exprs: List of TensorExpression objects
         is_intra_mode: True for intra-op optimization, False for cold-hot table generation
+        num_threads: Requested global worker budget for this compilation phase.
 
     Returns:
         Tuple of (heavy_idxs, light_idxs, light_threads, threads_per_heavy,
-                  heavy_batch_size, heavy_tree_params, n_heavy, n_light, avail_gb)
+                  heavy_batch_size, heavy_tree_params, n_heavy, n_light,
+                  avail_gb, worker_budget)
     """
-    n_cpu = _get_compile_thread_cap()
+    requested_threads = int(num_threads)
+    if requested_threads <= 0:
+        raise ValueError("num_threads must be positive")
+    n_cpu = min(requested_threads, _get_compile_thread_cap())
 
     # Classify ops using TensorExpression.is_light_op() method
     # Light: elementwise, reduce, relu, slice, pool (or < 3 dims >= 512)
@@ -347,24 +362,35 @@ def _classify_and_setup_ops(
 
     n_heavy, n_light = len(heavy_idxs), len(light_idxs)
 
-    # Light ops: all in parallel, each gets a fair share of CPUs
-    light_threads = max(1, n_cpu // max(1, n_light))
-
-    # Heavy ops: run multiple in parallel, each with many threads
+    # Bound the global worker budget by both CPUs and available memory.  Inner
+    # searches use process pools too, so outer concurrency times per-op
+    # concurrency must never exceed this value.
     avail_gb   = int(_get_available_memory_gb())
-    max_total_threads = min(n_cpu, int(avail_gb // INNER_GB))  # total threads we can spawn
-    num_ipu_cores = int(np.prod(exprs[0].num_cores))  # cores per IPU (assume all ops have same core count)
-    max_total_threads *= int(np.ceil(513 / num_ipu_cores))
-    max_total_threads = max(1, min(n_cpu, max_total_threads))
+    memory_worker_cap = max(1, int(avail_gb // INNER_GB))
+    worker_budget = max(1, min(n_cpu, memory_worker_cap))
 
-    # Threads per heavy op differs between modes
-    if is_intra_mode:
-        threads_per_heavy = max(1, n_cpu // 2)
+    # Light operators are cheap and run one worker each in the shared
+    # precomputation pool.  Giving each of them a nested pool only causes
+    # oversubscription while heavy spatial trees are being built.
+    light_threads = 1
+
+    # Balance parallelism across operators and within each operator.  The
+    # square-root split scales from 4 threads as 2x2 through 64 as 8x8,
+    # avoiding the previous hard-coded policy that could run only two heavy
+    # operators even on a large server.
+    if n_heavy:
+        target_parallel_ops = min(
+            n_heavy,
+            max(1, int(math.sqrt(worker_budget))),
+        )
+        threads_per_heavy = max(1, worker_budget // target_parallel_ops)
+        heavy_batch_size = min(
+            n_heavy,
+            max(1, worker_budget // threads_per_heavy),
+        )
     else:
-        threads_per_heavy = int(max(1, n_cpu // 4, max_total_threads // max(1, n_heavy)))
-
-    # How many heavy ops can run in parallel without exceeding RAM?
-    heavy_batch_size = int(max(1, max_total_threads // threads_per_heavy))
+        threads_per_heavy = 1
+        heavy_batch_size = 1
 
     # Build spatial tree parameters for heavy ops
     heavy_tree_params = []
@@ -376,7 +402,8 @@ def _classify_and_setup_ops(
                                   e.get_util_threshold(), num_core))
 
     return (heavy_idxs, light_idxs, light_threads, threads_per_heavy,
-            heavy_batch_size, heavy_tree_params, n_heavy, n_light, avail_gb)
+            heavy_batch_size, heavy_tree_params, n_heavy, n_light, avail_gb,
+            worker_budget)
 
 
 class DNNProgram:
@@ -675,11 +702,14 @@ class DNNProgram:
 
         # Classify ops and compute resource allocation
         (heavy_idxs, light_idxs, light_threads, threads_per_heavy,
-         heavy_batch_size, heavy_tree_params, n_heavy, n_light, avail_gb) = \
-            _classify_and_setup_ops(exprs, is_intra_mode=True)
+         heavy_batch_size, heavy_tree_params, n_heavy, n_light, avail_gb,
+         worker_budget) = _classify_and_setup_ops(
+            exprs, is_intra_mode=True, num_threads=num_threads
+        )
 
         print(f"  {num_ops} unique ops ({n_heavy} heavy / {n_light} light), "
               f"{avail_gb:.0f} GB avail", flush=True)
+        print(f"  global compile worker budget: {worker_budget}", flush=True)
         print(f"  light: {n_light} ops × {light_threads} threads in parallel", flush=True)
         print(f"  heavy: {threads_per_heavy} threads/op, {heavy_batch_size} ops/batch", flush=True)
 
@@ -692,7 +722,10 @@ class DNNProgram:
         tree_idx_map = {}  # future -> index in spatial_trees
 
         print(f"  running light ops + building {n_heavy} spatial trees + precomputing estimates concurrently...", flush=True)
-        with Pool(n_light + n_heavy * 2) as p:
+        precompute_workers = max(
+            1, min(worker_budget, n_light + n_heavy * 2)
+        )
+        with Pool(precompute_workers) as p:
             # Submit tree builds
             for idx, params in enumerate(heavy_tree_params):
                 fut = p.submit(_build_spatial_tree, params)
@@ -850,11 +883,14 @@ class DNNProgram:
 
         # Classify ops and compute resource allocation
         (heavy_idxs, light_idxs, light_threads, threads_per_heavy,
-         heavy_batch_size, heavy_tree_params, n_heavy, n_light, avail_gb) = \
-            _classify_and_setup_ops(exprs, is_intra_mode=False)
+         heavy_batch_size, heavy_tree_params, n_heavy, n_light, avail_gb,
+         worker_budget) = _classify_and_setup_ops(
+            exprs, is_intra_mode=False, num_threads=num_threads
+        )
 
         print(f"  {num_ops} unique ops ({n_heavy} heavy / {n_light} light), "
               f"{avail_gb:.0f} GB avail", flush=True)
+        print(f"  global compile worker budget: {worker_budget}", flush=True)
         print(f"  light: {n_light} ops × {light_threads} threads in parallel", flush=True)
         print(f"  heavy: {threads_per_heavy} threads/op, {heavy_batch_size} ops/batch", flush=True)
 
@@ -866,7 +902,10 @@ class DNNProgram:
         tree_idx_map = {}
 
         print(f"  running light ops + building {n_heavy} spatial trees concurrently...", flush=True)
-        with Pool(n_light + n_heavy) as p:
+        precompute_workers = max(
+            1, min(worker_budget, n_light + n_heavy)
+        )
+        with Pool(precompute_workers) as p:
             # Submit tree builds
             for idx, params in enumerate(heavy_tree_params):
                 fut = p.submit(_build_spatial_tree, params)
@@ -892,30 +931,54 @@ class DNNProgram:
                     done += 1
                     print(f"    [{done}/{num_ops}] Completed {res[1][0][0]}", flush=True)
 
-        # Phase 2: heavy ops in batches with pre-built spatial trees
-        for batch_start in range(0, n_heavy, heavy_batch_size):
-            batch_end = min(batch_start + heavy_batch_size, n_heavy)
-            batch_indices = heavy_idxs[batch_start:batch_end]
-            batch_trees = spatial_trees[batch_start:batch_end]
-            batch_size = len(batch_indices)
+        # Phase 2: keep a sliding window of heavy ops full.  Fixed batches
+        # leave workers idle whenever one operator in a batch is a straggler.
+        if n_heavy == 1:
+            i, tree = heavy_idxs[0], spatial_trees[0]
+            res = _compile_single_op_cold_hot(
+                (exprs[i], opnames_list[i], threads_per_heavy,
+                 cold_hot_threshold, tree)
+            )
+            results.append(res)
+            done += 1
+            print(f"    [{done}/{num_ops}] Completed {res[1][0][0]}", flush=True)
+        elif n_heavy > 1:
+            with Pool(heavy_batch_size) as p:
+                pending_futs = {}
+                next_op_idx = 0
+                while next_op_idx < min(heavy_batch_size, n_heavy):
+                    i = heavy_idxs[next_op_idx]
+                    tree = spatial_trees[next_op_idx]
+                    params = (
+                        exprs[i], opnames_list[i], threads_per_heavy,
+                        cold_hot_threshold, tree,
+                    )
+                    pending_futs[p.submit(_compile_single_op_cold_hot, params)] = i
+                    next_op_idx += 1
 
-            if batch_size == 1:
-                i, tree = batch_indices[0], batch_trees[0]
-                res = _compile_single_op_cold_hot(
-                    (exprs[i], opnames_list[i], threads_per_heavy, cold_hot_threshold, tree))
-                results.append(res)
-                done += 1
-                print(f"    [{done}/{num_ops}] Completed {res[1][0][0]}", flush=True)
-            else:
-                batch_params = [(exprs[i], opnames_list[i], threads_per_heavy, cold_hot_threshold, tree)
-                                for i, tree in zip(batch_indices, batch_trees)]
-                with Pool(batch_size) as p:
-                    futs = {p.submit(_compile_single_op_cold_hot, par): par for par in batch_params}
-                    for fut in as_completed(futs):
+                while pending_futs:
+                    for fut in as_completed(pending_futs):
                         res = fut.result()
                         results.append(res)
                         done += 1
-                        print(f"    [{done}/{num_ops}] Completed {res[1][0][0]}", flush=True)
+                        print(
+                            f"    [{done}/{num_ops}] Completed {res[1][0][0]}",
+                            flush=True,
+                        )
+                        del pending_futs[fut]
+
+                        if next_op_idx < n_heavy:
+                            i = heavy_idxs[next_op_idx]
+                            tree = spatial_trees[next_op_idx]
+                            params = (
+                                exprs[i], opnames_list[i], threads_per_heavy,
+                                cold_hot_threshold, tree,
+                            )
+                            pending_futs[
+                                p.submit(_compile_single_op_cold_hot, params)
+                            ] = i
+                            next_op_idx += 1
+                        break
 
         self.update_ops_and_compile_time(results)
         print("# Done: cold-hot table generation for all ops.", flush=True)

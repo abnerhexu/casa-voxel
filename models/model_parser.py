@@ -604,8 +604,42 @@ if len(sys.argv) > 4:
     IPU_CAPACITY_B = IPU_CAPACITY_KB * 1024
     IPU_CAPACITY_ELEM = IPU_CAPACITY_B // 2
 
-if len(sys.argv) > 5:
+if len(sys.argv) > 5 and not sys.argv[5].startswith("--"):
     KV_CACHE_SEQ_LEN = int(sys.argv[5])
+
+def get_optional_int_arg(flag: str) -> Optional[int]:
+    if flag not in sys.argv:
+        return None
+    idx = sys.argv.index(flag)
+    if idx + 1 >= len(sys.argv):
+        raise ValueError(f"missing value for {flag}")
+    return int(sys.argv[idx + 1])
+
+source_total_layers = get_optional_int_arg("--total-layers")
+motif_start_layer = get_optional_int_arg("--motif-start-layer")
+motif_layers = get_optional_int_arg("--motif-layers")
+motif_args = (source_total_layers, motif_start_layer, motif_layers)
+if any(value is not None for value in motif_args):
+    if any(value is None for value in motif_args):
+        raise ValueError(
+            "--total-layers, --motif-start-layer, and --motif-layers "
+            "must be specified together"
+        )
+    if source_total_layers <= 0 or motif_layers <= 0:
+        raise ValueError("total layers and motif layers must be positive")
+    if motif_start_layer < 0 or motif_start_layer + motif_layers > source_total_layers:
+        raise ValueError(
+            f"motif [{motif_start_layer}, {motif_start_layer + motif_layers}) "
+            f"is outside the {source_total_layers}-layer model"
+        )
+    motif_tag = f"-motif{motif_start_layer}+{motif_layers}"
+    output_filename = f"parsed/parsed_{model_filename[:-5]}{motif_tag}.json"
+    if len(sys.argv) > 2:
+        texpre_filename = (
+            f"TExpr/TExpr_{model_filename[:-5]}-b{batchsize}{motif_tag}.json"
+        )
+    else:
+        texpre_filename = f"TExpr/TExpr_{model_filename[:-5]}{motif_tag}.json"
 
 # Git does not preserve empty output directories, so a fresh clone may not
 # contain these paths yet.  Create them before the parser emits either file.
@@ -613,6 +647,16 @@ Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
 Path(texpre_filename).parent.mkdir(parents=True, exist_ok=True)
 
 ops = parse_model(f"original/{model_filename}")
+if source_total_layers is not None:
+    if len(ops) % source_total_layers:
+        raise ValueError(
+            f"cannot split {len(ops)} source operators evenly across "
+            f"{source_total_layers} layers before parser partitioning"
+        )
+    source_ops_per_layer = len(ops) // source_total_layers
+    motif_begin = motif_start_layer * source_ops_per_layer
+    motif_end = (motif_start_layer + motif_layers) * source_ops_per_layer
+    ops = ops[motif_begin:motif_end]
 ops_id_dict: Dict[int, Operator] = {op.id: op for op in ops}
 # find users of all ops
 for op in ops:
