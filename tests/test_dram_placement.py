@@ -106,9 +106,16 @@ class DRAMPlacementTest(unittest.TestCase):
         self.assertEqual(channel[key].policy, "channel_aware")
         self.assertNotEqual(software[key].bank_ids, channel[key].bank_ids)
 
-    def test_invalid_channel_geometry_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "must be divisible"):
-            channel_aware_placements(make_records(), 16, 3)
+    def test_non_divisible_channel_geometry_is_balanced_and_valid(self):
+        plan = channel_aware_placements(make_records(), 16, 3)
+        self.assertEqual(len(plan), len(make_records()))
+        for placement in plan.values():
+            self.assertTrue(placement.bank_ids)
+            self.assertTrue(all(0 <= bank < 16 for bank in placement.bank_ids))
+            self.assertEqual(
+                set(placement.channel_ids),
+                {bank % 3 for bank in placement.bank_ids},
+            )
 
     def test_shared_builder_supports_every_public_policy(self):
         records = make_records()
@@ -122,6 +129,21 @@ class DRAMPlacementTest(unittest.TestCase):
                 for placement in plan.values():
                     self.assertEqual(placement.policy, policy)
                     self.assertTrue(placement.bank_ids)
+
+    def test_address_trace_and_hbm_interleave_use_distinct_start_rules(self):
+        records = make_records()
+        for ordinal, item in enumerate(records):
+            item["address"] = ordinal * 4096
+        address_plan = build_placement_plan(
+            records, 16, 4, "address_trace", stripe_bytes=128
+        )
+        interleave_plan = build_placement_plan(
+            records, 16, 4, "hbm_interleave", stripe_bytes=128
+        )
+        self.assertTrue(any(
+            address_plan[key].bank_ids != interleave_plan[key].bank_ids
+            for key in address_plan
+        ))
 
     def test_placement_cache_is_keyed_by_policy_and_channel_geometry(self):
         records = make_records()

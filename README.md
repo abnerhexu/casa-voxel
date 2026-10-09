@@ -238,14 +238,17 @@ transactions. tRAS is not modelled.
 
 DRAM configurations may describe physical geometry explicitly with
 `num_layers`, `banks_per_layer`, `num_channels`, `bytes_per_row`, and
-`transaction_bytes`. The default geometry is 8 layers x 16 banks (128 banks),
-one logical channel, and 128-byte transactions. `DRAMGeometry` validates that
-the total bank count is evenly divisible by the channel count and provides a
-single bank numbering scheme shared by timing, conflict, and placement code.
+`transaction_bytes`. The default geometry is 8 layers x 32 banks (256 banks),
+one logical channel, and 128-byte transactions. For non-divisible channel
+counts, modulo interleaving assigns either floor(banks/channels) or
+ceil(banks/channels) banks per channel, differing by at most one. The same
+bank numbering is shared by timing, conflict, and placement code.
 Older configurations containing only `num_banks_per_channel` remain accepted.
 
 `bytes_per_cycle` is the aggregate per-core service rate across the complete
-DRAM. Under a fixed total-bandwidth budget, each channel receives
+DRAM. Hardware configuration bandwidths default to decimal GB/s and retain
+fractional per-core rates; `bandwidth_unit: "GiB/s"` is available for explicit
+legacy inputs. Under a fixed total-bandwidth budget, each channel receives
 `bytes_per_cycle / num_channels`; channels own independent data buses and run
 concurrently. `transaction_bytes` (128 B by default) controls request and row-
 segment granularity only, so changing sustained bandwidth cannot silently

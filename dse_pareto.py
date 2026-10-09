@@ -140,7 +140,7 @@ def make_hw_config(sa, dram_bw, noc_topo, noc_bw):
             "num_access_per_row": FIXED["row"],
             "npu_freq_MHz": NPU_FREQ_MHZ,
             "num_layers": 8,
-            "banks_per_layer": 16,
+            "banks_per_layer": 32,
             "num_channels": 1,
             "transaction_bytes": 128,
         },

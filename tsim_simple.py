@@ -27,7 +27,7 @@ import sys
 import time
 import math
 import statistics
-from typing import Any, Dict, IO, List, Tuple
+from typing import Any, Dict, IO, List, Optional, Sequence, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from icbm_DNNProgram import *
@@ -435,7 +435,8 @@ def run_tsim_helper(params):
 def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:DRAM, noc:NoC, comp_op:Compute_OP,
              core_group_size:int, dram_bandwidth_GBps:int, npu_freq_MHz:int, tot_layers:int, sim_layers:int,
              dram_name:str = "unspec_mem", spmd_compiler:bool = False, seq_noc:bool = False,
-             aggregate_scale:float = 1.0) -> \
+             aggregate_scale:float = 1.0,
+             tiling_override:Optional[Sequence[Tuple[object, object]]] = None) -> \
             Tuple[HardwareConfig, int, int, List[FusedOperatorExecLog], List[OverlapInterval]]:
     """Run a full temporal simulation for one hardware configuration.
 
@@ -481,6 +482,12 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         unfused_ops = prog.ops[:len(prog.ops) * (sim_layers) // tot_layers]
     else:
         unfused_ops = prog.ops
+    if tiling_override is not None and len(tiling_override) != len(unfused_ops):
+        raise ValueError(
+            "tiling_override must contain exactly one (spatial, temporal) "
+            f"configuration per simulated operator: got {len(tiling_override)} "
+            f"for {len(unfused_ops)} operators"
+        )
     all_tensor_shapes = []
     all_temporal_partitions = []
     all_partitions = []
@@ -491,7 +498,28 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
     for i in range(len(unfused_ops)):
         op = unfused_ops[i]
         # Find the best spatial/temporal partition that fits within the execution scratch-pad.
-        spatial, temporal = prog.get_best_config_by_max_mem_size(op, dram, exe_space, core_group_size)
+        if tiling_override is None:
+            spatial, temporal = prog.get_best_config_by_max_mem_size(
+                op, dram, exe_space, core_group_size
+            )
+        else:
+            spatial, temporal = tiling_override[i]
+            frozen_config = (
+                prog._freeze_tiling_value(spatial),
+                prog._freeze_tiling_value(temporal),
+            )
+            if frozen_config not in op.expr.config_dict:
+                raise ValueError(
+                    f"tiling_override[{i}] is not a compiled candidate for "
+                    f"operator {op.name}: {frozen_config!r}"
+                )
+            hot_bytes = op.expr.config_dict[frozen_config][0]
+            if hot_bytes > exe_space:
+                raise ValueError(
+                    f"tiling_override[{i}] requires {hot_bytes} execution "
+                    f"bytes, exceeding exe_space={exe_space}"
+                )
+            spatial, temporal = frozen_config
         tensor_shapes = op.expr.get_sub_op_var_sizes(temporal, spatial, False)
         all_temporal_partitions.append(temporal)
         all_partitions.append((temporal, spatial))
@@ -579,13 +607,18 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         stats["dram_base_energy"] + stats["dram_row_conflict_energy"],
         rel_tol=1e-9,
     ), "DRAM base and row-conflict energies do not sum to total DRAM energy"
-    dram_bytes = prog.get_fused_dram_bytes_only(fused_ops=fused_ops, partitions=all_partitions, dram=dram,
-                            use_largest_cold=use_largest_cold, exe_sram_per_core=exe_space,
-                            core_group_size=core_group_size)
-
-    # Overwrite unfused op dram traffic with fused op traffic
-    stats["dram_r_bytes"] = sum([dram_op_bytes[0] for dram_op_bytes in dram_bytes])
-    stats["dram_w_bytes"] = sum([dram_op_bytes[1] for dram_op_bytes in dram_bytes])
+    # Bytes, row events, timing, and energy must share one source of truth.
+    # get_fused_exec_time above intentionally executes the unfused operator
+    # stream; summing its logs preserves exactly the traffic that the DRAM
+    # session scheduled and the energy model charged.  The previous code
+    # recomputed a differently fused byte stream here, which made the exported
+    # 7 pJ/B energy impossible to reproduce from exported DRAM bytes.
+    stats["dram_r_bytes"] = sum(
+        int(getattr(log, "dram_r_bytes", 0)) for log in fused_op_logs
+    )
+    stats["dram_w_bytes"] = sum(
+        int(getattr(log, "dram_w_bytes", 0)) for log in fused_op_logs
+    )
 
     if(stats["exec_time"] ==-1):
         overlap_intervals =[]
@@ -605,8 +638,18 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
 
     # DRAM utilization = actual bytes transferred / theoretical max bytes in exec window.
     # Denominator: exec_time_in_seconds * bandwidth_in_bytes_per_second.
-    stats["dram_r_util"] = stats["dram_r_bytes"]/(stats["exec_time"] / (1e6 * npu_freq_MHz) * dram_bandwidth_GBps * 2 ** 30)
-    stats["dram_w_util"] = stats["dram_w_bytes"]/(stats["exec_time"] / (1e6 * npu_freq_MHz) * dram_bandwidth_GBps * 2 ** 30)
+    modeled_bandwidth_bytes_per_second = (
+        float(dram.total_bytes_per_cycle)
+        * float(prog.tot_num_cores)
+        * float(npu_freq_MHz)
+        * 1e6
+    )
+    utilization_denominator = (
+        stats["exec_time"] / (1e6 * npu_freq_MHz)
+        * modeled_bandwidth_bytes_per_second
+    )
+    stats["dram_r_util"] = stats["dram_r_bytes"] / utilization_denominator
+    stats["dram_w_util"] = stats["dram_w_bytes"] / utilization_denominator
 
     # Legacy subset simulation and explicit motif scaling share the same
     # aggregate-only scaling path.  A motif is already the complete simulated

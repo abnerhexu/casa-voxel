@@ -124,7 +124,8 @@ def get_hw_modules( hw_config, num_cores,
     # byte throughput based on the NPU clock frequency and core count.
     dram_info = hw_config["dram"]
     per_cycle_bytes_per_core = get_per_cycle_bytes_per_core_from_DRAM_config(num_cores,
-                                    dram_info["bandwidth_GBps"], dram_info["npu_freq_MHz"])
+                                    dram_info["bandwidth_GBps"], dram_info["npu_freq_MHz"],
+                                    dram_info.get("bandwidth_unit", "GB/s"))
     # New configurations specify a physical row size directly. Retain the
     # legacy accesses-per-row conversion for older generated JSON files.
     if "bytes_per_row" in dram_info:
@@ -144,7 +145,7 @@ def get_hw_modules( hw_config, num_cores,
 
     geometry_kwargs = {
         "num_layers": int(dram_info.get("num_layers", 8)),
-        "banks_per_layer": int(dram_info.get("banks_per_layer", 16)),
+        "banks_per_layer": int(dram_info.get("banks_per_layer", 32)),
         "num_channels": int(dram_info.get("num_channels", 1)),
         "transaction_bytes": int(dram_info.get("transaction_bytes", 128)),
     }
@@ -196,6 +197,18 @@ def get_hw_modules( hw_config, num_cores,
                 capacity_bytes=capacity_bytes,
                 **geometry_kwargs,
                 **dram_kwargs)
+    # Metadata used by the bounded scheduler and machine-readable experiment
+    # records. tRAS is recorded for architectural completeness but remains
+    # intentionally absent from the timing model.
+    dram.tRAS_recorded = int(dram_info.get("tRAS_recorded", dram_info.get("tRAS", 0)))
+    dram.frfcfs_window = int(dram_info.get("frfcfs_window", 32))
+    dram.tsv_buses_per_channel = int(dram_info.get("tsv_buses_per_channel", 1))
+    dram.tsv_bus_bandwidth_GBps = float(
+        dram_info.get(
+            "tsv_bus_bandwidth_GBps",
+            float(dram_info["bandwidth_GBps"]) / max(1, dram.num_channels),
+        )
+    )
 
     # --- NoC (Network-on-Chip) module ---
     noc_info = hw_config["noc"]

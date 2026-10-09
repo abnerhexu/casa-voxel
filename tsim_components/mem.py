@@ -23,7 +23,7 @@ from math import ceil
 
 # Legacy default number of DRAM banks shared across all cores. New code uses
 # ``DRAMGeometry.total_banks``; the constant remains part of the public API.
-NUM_BANKS = 128
+NUM_BANKS = 256
 
 # Default DRAM timing parameters shared across the codebase.
 # These match the values in hw_config/*.json and run_all_tests.py.
@@ -43,13 +43,14 @@ class DRAMGeometry:
     """Physical DRAM geometry shared by placement and timing models.
 
     Banks are numbered first by layer and then within a layer. Channels are
-    assigned by interleaving global bank IDs, which keeps every channel's bank
-    count equal while distributing each layer across channels. Transaction
-    size is intentionally independent from sustained controller bandwidth.
+    assigned by interleaving global bank IDs, which balances channel bank
+    counts to within one while distributing each layer across channels.
+    Transaction size is intentionally independent from sustained controller
+    bandwidth.
     """
 
     num_layers: int = 8
-    banks_per_layer: int = 16
+    banks_per_layer: int = 32
     num_channels: int = 1
     bytes_per_row: int = 8192
     transaction_bytes: int = 128
@@ -61,19 +62,34 @@ class DRAMGeometry:
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
-        if self.total_banks % int(self.num_channels):
-            raise ValueError(
-                f"total_banks ({self.total_banks}) must be divisible by "
-                f"num_channels ({self.num_channels})"
-            )
-
     @property
     def total_banks(self) -> int:
         return int(self.num_layers) * int(self.banks_per_layer)
 
     @property
     def banks_per_channel(self) -> int:
-        return self.total_banks // int(self.num_channels)
+        """Maximum banks assigned to one channel.
+
+        The legacy scalar is retained for callers which size rectangular
+        arrays.  For non-divisible geometries use ``bank_counts_per_channel``
+        to obtain the exact balanced distribution.
+        """
+        return int(ceil(self.total_banks / int(self.num_channels)))
+
+    @property
+    def bank_counts_per_channel(self) -> Tuple[int, ...]:
+        """Exact modulo-interleaved bank count of every channel.
+
+        Global bank ``b`` belongs to channel ``b % num_channels``.  The first
+        ``total_banks % num_channels`` channels therefore receive one extra
+        bank, which guarantees that channel loads differ by at most one.
+        Channels beyond the bank count are legal and receive zero banks.
+        """
+        quotient, remainder = divmod(self.total_banks, int(self.num_channels))
+        return tuple(
+            quotient + (1 if channel < remainder else 0)
+            for channel in range(int(self.num_channels))
+        )
 
     def decode_bank(self, global_bank_id: int) -> Tuple[int, int, int, int]:
         """Return ``(channel, bank_in_channel, layer, bank_in_layer)``."""
@@ -87,13 +103,16 @@ class DRAMGeometry:
         bank_in_channel = bank // int(self.num_channels)
         return channel, bank_in_channel, layer, bank_in_layer
 
-    def as_dict(self) -> Dict[str, int]:
+    def as_dict(self) -> Dict[str, Any]:
         return {
             "num_layers": int(self.num_layers),
             "banks_per_layer": int(self.banks_per_layer),
             "total_banks": self.total_banks,
             "num_channels": int(self.num_channels),
             "banks_per_channel": self.banks_per_channel,
+            "bank_counts_per_channel": list(self.bank_counts_per_channel),
+            "min_banks_per_channel": min(self.bank_counts_per_channel),
+            "max_banks_per_channel": max(self.bank_counts_per_channel),
             "bytes_per_row": int(self.bytes_per_row),
             "transaction_bytes": int(self.transaction_bytes),
         }
@@ -121,9 +140,10 @@ def get_hbm_package_footprint_mm(
 
 
 def get_per_cycle_bytes_per_core_from_DRAM_config(num_cores: int,
-                                                  total_bandwidth_GBps: int,
+                                                  total_bandwidth_GBps: float,
                                                   npu_freq_MHz: int,
-                                                  ) -> int:
+                                                  bandwidth_unit: str = "GB/s",
+                                                  ) -> float:
     """Convert chip-level DRAM bandwidth to per-core, per-cycle byte count.
 
     Parameters
@@ -131,21 +151,34 @@ def get_per_cycle_bytes_per_core_from_DRAM_config(num_cores: int,
     num_cores : int
         Number of cores sharing the total DRAM bandwidth.
     total_bandwidth_GBps : int
-        Aggregate off-chip bandwidth in GiB/s (binary gigabytes).
+        Aggregate off-chip bandwidth.  The default unit is decimal GB/s.
     npu_freq_MHz : int
         Core clock frequency in MHz.
 
     Returns
     -------
-    int
-        Bytes each core can transfer in a single clock cycle
-        (floor-divided evenly across cores).
+    float
+        Bytes each core can transfer in a single clock cycle.  Fractional
+        rates are retained so a channel-count sweep does not silently lose
+        bandwidth through integer floor division.
     """
-    # Convert GiB/s to bytes/s, then divide by frequency (cycles/s) to get bytes/cycle.
-    num_byte_per_cycle = total_bandwidth_GBps * (2**30) / npu_freq_MHz / (10**6)
-    # Divide equally across all cores (floor division).
-    num_byte_per_core_per_cycle = num_byte_per_cycle // num_cores
-    return num_byte_per_core_per_cycle
+    if int(num_cores) <= 0 or int(npu_freq_MHz) <= 0:
+        raise ValueError("num_cores and npu_freq_MHz must be positive")
+    normalized_unit = str(bandwidth_unit).strip().lower().replace(" ", "")
+    if normalized_unit in {"gb/s", "gbps", "decimal"}:
+        bytes_per_gb = 10**9
+    elif normalized_unit in {"gib/s", "gibps", "binary"}:
+        bytes_per_gb = 2**30
+    else:
+        raise ValueError(
+            f"unsupported DRAM bandwidth unit {bandwidth_unit!r}; "
+            "expected GB/s or GiB/s"
+        )
+    num_byte_per_cycle = (
+        float(total_bandwidth_GBps) * bytes_per_gb
+        / (float(npu_freq_MHz) * 10**6)
+    )
+    return num_byte_per_cycle / int(num_cores)
 
 def get_sram_area_from_size(sram_size_KB: int, memtype="3D-SRAM") -> int:
     """Estimate SRAM silicon area (mm^2) for a given capacity.
@@ -285,7 +318,7 @@ class DRAM:
                  use_sram: bool = False,
                  precise: bool = False,
                  num_banks_per_channel: Optional[int] = None,
-                 banks_per_layer: int = 16,
+                 banks_per_layer: int = 32,
                  num_channels: int = 1,
                  transaction_bytes: int = 128,
                  geometry: Optional[DRAMGeometry] = None,
@@ -473,7 +506,7 @@ class DRAM:
         self,
         placement_policy: str = "software_aware",
         replication_factor: int = 1,
-        frfcfs_window: int = 32,
+        frfcfs_window: Optional[int] = None,
     ):
         """Create a stateful placement-aware timing/conflict session.
 
@@ -485,7 +518,10 @@ class DRAM:
             self,
             placement_policy=placement_policy,
             replication_factor=replication_factor,
-            frfcfs_window=frfcfs_window,
+            frfcfs_window=(
+                int(frfcfs_window) if frfcfs_window is not None
+                else int(getattr(self, "frfcfs_window", 32))
+            ),
         )
 
     def _populate_from_dram_cache(self) -> None:

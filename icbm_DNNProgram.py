@@ -1482,9 +1482,8 @@ class DNNProgram:
             ignore_list = op.expr.ignore_variables
             # access_list[0] is the output; access_list[1:] are inputs.
             # Only accumulate reads for non-ignored input variables.
-            # bytes_per_cycle is per-core, reconstruct chip-level TBps.
-            # get_per_cycle_bytes_per_core uses 2^30 (binary GiB) and floor division,
-            # so the correct inverse is / 2^40 (not / 1e12). ~1% error from floor div.
+            # bytes_per_cycle is a fractional per-core rate derived from the
+            # configured decimal GB/s bandwidth; no integer flooring is used.
             std_time_fac = 1
             for tensor_index, (load_time, load_bytes, granularity, row_conflicts, ignore) in enumerate(
                 zip(access_list_cycles[1:], access_list_bytes[1:], access_list_granularity[1:],
@@ -1607,7 +1606,13 @@ class DNNProgram:
 
         return int(noc_bcast), int(noc_shift), int(noc_reduce)
 
-    def get_aggregate_hot_cold_sizes(self, fused_op: List[TensorOperator], exe_sram_per_core, use_largest_cold: bool):
+    def get_aggregate_hot_cold_sizes(
+        self,
+        fused_op: List[TensorOperator],
+        exe_sram_per_core,
+        use_largest_cold: bool,
+        partitions: Optional[List[Tuple[object, object]]] = None,
+    ):
         """Sum the hot and cold SRAM sizes across all sub-operators in a fused group.
 
         TODO: does ignore need to be checked here? -- NOTE: simple summation
@@ -1623,8 +1628,30 @@ class DNNProgram:
             ``(total_cold_size, total_hot_size)`` in bytes.
         """
         (cold_size, hot_size) = (0, 0)
-        for op in fused_op:
-            op_cold_size, op_hot_size = self.get_max_min_cold_and_hot(op, exe_sram_per_core, use_largest_cold)
+        if partitions is not None and len(partitions) != len(fused_op):
+            raise ValueError("one partition is required per fused sub-operator")
+        for op_index, op in enumerate(fused_op):
+            if partitions is None:
+                op_cold_size, op_hot_size = self.get_max_min_cold_and_hot(
+                    op, exe_sram_per_core, use_largest_cold
+                )
+            else:
+                temporal, spatial = partitions[op_index]
+                config = (
+                    self._freeze_tiling_value(spatial),
+                    self._freeze_tiling_value(temporal),
+                )
+                if config not in op.expr.config_dict:
+                    raise ValueError(
+                        f"partition is not a compiled candidate for {op.name}: "
+                        f"{config!r}"
+                    )
+                op_hot_size = int(op.expr.config_dict[config][0])
+                cold_dict = op.expr.hot_cold_table[op_hot_size]
+                op_cold_size = int(
+                    next(reversed(cold_dict))
+                    if use_largest_cold else next(iter(cold_dict))
+                )
             cold_size += op_cold_size
             hot_size += op_hot_size
         return cold_size, hot_size
@@ -1895,13 +1922,23 @@ class DNNProgram:
 
         peak_sa_flopc, peak_vu_flopc = comp.get_peak_flopc()
         inv_tot_num_cores = 1.0 / self.tot_num_cores
+        partition_cursor = 0
         for (idx, fused_op) in enumerate(fused_ops):
             # --- 1. NoC timing ---
             noc_bcast_cycles, shift_cycles, reduce_cycles = self.get_noc_times(fused_op, noc_part_it, noc_data_it, noc)
             noc_op_times.append((noc_bcast_cycles, shift_cycles, reduce_cycles))
 
             # --- 2. SRAM hot/cold footprint ---
-            cold_size, hot_size = self.get_aggregate_hot_cold_sizes(fused_op, exe_sram_per_core, use_largest_cold)
+            fused_partitions = partitions[
+                partition_cursor:partition_cursor + len(fused_op)
+            ]
+            partition_cursor += len(fused_op)
+            cold_size, hot_size = self.get_aggregate_hot_cold_sizes(
+                fused_op,
+                exe_sram_per_core,
+                use_largest_cold,
+                partitions=fused_partitions,
+            )
 
             # --- 3. DRAM cycles and byte traffic ---
             dram_r_traffic, dram_w_traffic, dram_access_records = \

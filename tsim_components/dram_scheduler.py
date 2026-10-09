@@ -255,14 +255,37 @@ class DRAMExecutionSession:
         record_counts: Dict[int, List[int]] = {}
 
         while pending:
-            # FR-FCFS approximation: prioritize an open-row hit within a
-            # bounded request window; retain deterministic order otherwise.
-            choice = 0
-            for candidate in range(min(self.frfcfs_window, len(pending))):
-                run = pending[candidate]
-                if self._open_rows[run.bank_id] == run.row_start:
-                    choice = candidate
-                    break
+            # Bounded FR-FCFS approximation.  First choose the request that
+            # can reach its channel bus earliest, then prefer a row hit among
+            # requests tied at that ready time.  This avoids idling a channel
+            # behind an older request whose bank is still busy while keeping
+            # the scheduler O(window) instead of expanding transaction-level
+            # traces.
+            def candidate_key(candidate: int) -> Tuple[int, int, int]:
+                candidate_run = pending[candidate]
+                candidate_open = self._open_rows[candidate_run.bank_id]
+                candidate_hit = candidate_open == candidate_run.row_start
+                candidate_miss = candidate_open < 0
+                candidate_conflicts = (
+                    (0 if candidate_hit or candidate_miss else 1)
+                    + max(0, candidate_run.row_count - 1)
+                )
+                candidate_row_cycles = (
+                    candidate_run.row_count * int(self.dram.CL)
+                    + (1 if candidate_miss else 0) * int(self.dram.tRCD)
+                    + candidate_conflicts
+                    * (int(self.dram.tRP) + int(self.dram.tRCD))
+                )
+                ready = max(
+                    bank_free[candidate_run.bank_id] + candidate_row_cycles,
+                    channel_free[candidate_run.channel_id],
+                )
+                return ready, 0 if candidate_hit else 1, candidate
+
+            choice = min(
+                range(min(self.frfcfs_window, len(pending))),
+                key=candidate_key,
+            )
             run = pending.pop(choice)
             open_row = self._open_rows[run.bank_id]
             first_hit = open_row == run.row_start

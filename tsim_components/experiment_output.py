@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-EXPERIMENT_SCHEMA_VERSION = 1
+EXPERIMENT_SCHEMA_VERSION = 2
 
 
 def _json_value(value: Any) -> Any:
@@ -209,10 +209,24 @@ def build_experiment_record(
                     "tCL": int(dram.CL),
                     "tRCD": int(dram.tRCD),
                     "tRP": int(dram.tRP),
+                    "tRAS_recorded_not_modeled": int(
+                        getattr(dram, "tRAS_recorded", 0)
+                    ),
                 },
-                "aggregate_bandwidth_gib_per_s": float(hardware.dram_bw_GBps),
-                "channel_bandwidth_gib_per_s": float(
+                "aggregate_bandwidth_gb_per_s": float(hardware.dram_bw_GBps),
+                "channel_bandwidth_gb_per_s": float(
                     hardware.dram_bw_GBps / max(1, dram.num_channels)
+                ),
+                "bandwidth_unit": "GB/s_decimal",
+                "tsv_buses_per_channel": int(
+                    getattr(dram, "tsv_buses_per_channel", 1)
+                ),
+                "tsv_bus_bandwidth_gb_per_s": float(
+                    getattr(
+                        dram,
+                        "tsv_bus_bandwidth_GBps",
+                        hardware.dram_bw_GBps / max(1, dram.num_channels),
+                    )
                 ),
                 "aggregate_bytes_per_cycle_per_core": float(
                     dram.total_bytes_per_cycle
@@ -228,7 +242,7 @@ def build_experiment_record(
                 ),
                 "scheduler": {
                     "name": "bounded_fr_fcfs",
-                    "request_window": 32,
+                    "request_window": int(getattr(dram, "frfcfs_window", 32)),
                     "models_tRAS": False,
                 },
                 "placement_policy": str(placement_policy),

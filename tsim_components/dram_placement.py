@@ -157,12 +157,13 @@ def channel_aware_placements(
     """
     total_banks = max(1, int(total_banks))
     num_channels = max(1, int(num_channels))
-    if total_banks % num_channels:
-        raise ValueError(
-            f"total_banks ({total_banks}) must be divisible by "
-            f"num_channels ({num_channels})"
-        )
-    banks_per_channel = total_banks // num_channels
+    channel_banks = [
+        tuple(range(channel, total_banks, num_channels))
+        for channel in range(num_channels)
+    ]
+    active_channels = [
+        channel for channel, banks in enumerate(channel_banks) if banks
+    ]
     valid_records = [record for record in records if record_bytes(record) > 0]
     if not valid_records:
         return {}
@@ -173,9 +174,13 @@ def channel_aware_placements(
         key=lambda record: (-record_bytes(record), record_signature(record)),
     )
     channel_load = [0.0] * num_channels
-    read_cursor = [int(seed + channel * 17) % banks_per_channel for channel in range(num_channels)]
+    read_cursor = [
+        int(seed + channel * 17) % max(1, len(channel_banks[channel]))
+        for channel in range(num_channels)
+    ]
     write_cursor = [
-        int(seed + channel * 17 + max(1, banks_per_channel // 2)) % banks_per_channel
+        int(seed + channel * 17 + max(1, len(channel_banks[channel]) // 2))
+        % max(1, len(channel_banks[channel]))
         for channel in range(num_channels)
     ]
     result: Dict[RecordSignature, TensorPlacement] = {}
@@ -186,35 +191,40 @@ def channel_aware_placements(
         # At least one channel is always selected; very large tensors can use
         # every channel and exploit channel-level parallelism.
         channel_span = max(1, min(
-            num_channels,
-            int(ceil(num_channels * size / max(1, total_bytes))),
+            len(active_channels),
+            int(ceil(len(active_channels) * size / max(1, total_bytes))),
         ))
         rotation = int(seed) % num_channels
         selected = sorted(
-            range(num_channels),
+            active_channels,
             key=lambda channel: (
                 channel_load[channel],
-                (channel - rotation) % num_channels,
+                (channel - rotation) % max(1, num_channels),
             ),
         )[:channel_span]
 
         # Allocate a size-proportional stripe inside each selected channel.
-        local_span = max(1, min(
-            banks_per_channel,
-            int(ceil(banks_per_channel * size / max(1, total_bytes))),
-        ))
         stage = str(record.get("stage", "")).lower()
         cursors = write_cursor if stage == "write" else read_cursor
         global_banks = []
         for channel in sorted(selected):
-            local_banks = _rotating_indices(
-                banks_per_channel, cursors[channel], local_span
+            available_banks = channel_banks[channel]
+            local_span = max(1, min(
+                len(available_banks),
+                int(ceil(
+                    len(available_banks) * size / max(1, total_bytes)
+                )),
+            ))
+            local_indices = _rotating_indices(
+                len(available_banks), cursors[channel], local_span
             )
             global_banks.extend(
-                channel + local_bank * num_channels
-                for local_bank in local_banks
+                available_banks[local_index]
+                for local_index in local_indices
             )
-            cursors[channel] = (cursors[channel] + local_span) % banks_per_channel
+            cursors[channel] = (
+                cursors[channel] + local_span
+            ) % len(available_banks)
             channel_load[channel] += float(size) / channel_span
 
         result[record_signature(record)] = TensorPlacement(
@@ -275,9 +285,17 @@ def _build_placement_plan_uncached(
             ))
             start = stable_u64(policy, seed, *signature) % total_banks
             banks = _rotating_indices(total_banks, start, span)
+        elif policy == "hbm_interleave":
+            # Idealized fine-grain HBM interleaving rotates each tensor stripe
+            # independently of its allocated physical base. This intentionally
+            # differs from address_trace, whose bank order is decoded from the
+            # motif-global tensor address.
+            start = stable_u64(policy, seed, ordinal, *signature) % total_banks
+            span = max(1, min(total_banks, int(ceil(size / stripe_bytes))))
+            banks = _rotating_indices(total_banks, start, span)
         else:
-            # hbm_interleave and address_trace both stripe a deterministic
-            # synthetic address range.  If a trace supplies an address, it
+            # address_trace stripes the tensor's deterministic synthetic
+            # physical address range. If a trace supplies an address, it
             # becomes the starting stripe; otherwise the tensor signature is
             # a stable substitute.
             address = record.get("address")

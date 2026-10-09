@@ -1,5 +1,6 @@
 from typing import List, Dict, Set, Tuple, Any, Union
 import math
+import numbers
 HW_UNITS = ["dram_r", "dram_w", "comp_sram_r", "comp_sram_w", "comp_sa", "comp_vu", "comp", "noc"]
 HW_COLORS = {
     "dram_r": "viridis",
@@ -500,17 +501,17 @@ class FusedOperatorExecLog:
 
     def get_dram_util_intensity(self, dram_bw_GBps, npu_freq_MHz) -> Tuple[float, float]:
         # Compute the dram bandwidth utilization as a fraction of peak bw for r, w. TODO check cycle computation to make sure this aligns.
-        assert(isinstance(dram_bw_GBps, int))
-        assert(isinstance(npu_freq_MHz, int))
+        assert(isinstance(dram_bw_GBps, numbers.Real))
+        assert(isinstance(npu_freq_MHz, numbers.Real))
         assert(dram_bw_GBps > 0), "DRAM bandwidth should be positive!"
         assert(npu_freq_MHz > 0), "NPU must be running!"
         # print(f"W bytes: {dram_bw_GBps * 2 ** 30 * self.dram_st_dur / (npu_freq_MHz * 1e6)}")
         if(self.dram_ld_dur):
-            read_intensity = self.dram_r_bytes / (dram_bw_GBps * 2 ** 30 * self.dram_ld_dur / (npu_freq_MHz * 1e6))
+            read_intensity = self.dram_r_bytes / (dram_bw_GBps * 1e9 * self.dram_ld_dur / (npu_freq_MHz * 1e6))
         else:
             read_intensity = 0
         if(self.dram_st_dur):
-            write_intensity = self.dram_w_bytes / (dram_bw_GBps * 2 ** 30 * self.dram_st_dur / (npu_freq_MHz * 1e6))
+            write_intensity = self.dram_w_bytes / (dram_bw_GBps * 1e9 * self.dram_st_dur / (npu_freq_MHz * 1e6))
         else:
             write_intensity = 0
         # assert(read_intensity >= 0 and read_intensity <= 1), "Read intensity should be a float between 0 and 1!"
