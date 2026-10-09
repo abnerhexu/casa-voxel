@@ -94,3 +94,34 @@ class FrozenReplayTest(unittest.TestCase):
         records[0].update(cycles_per_core=200, scheduled_cycles=200, total_row_conflicts=4)
         replay = self.session(make_dram(bytepc=64), frozen=original.snapshot)
         self.assertEqual(replay.schedule_records(records, 0).read.num_bytes, 1024)
+
+    def test_corrupt_frozen_run_is_rejected_without_noc(self):
+        records = [record("read", 1, 1024)]
+        original = self.session(make_dram())
+        original.schedule_records(records, 0)
+        original.snapshot["operations"]["0"]["runs"][0]["num_bytes"] -= 1
+        with self.assertRaisesRegex(ValueError, "conserve"):
+            self.session(make_dram(), frozen=original.snapshot).schedule_records(records, 0)
+
+    def test_ideal_dram_keeps_noc_and_ideal_noc_keeps_dram(self):
+        from tsim_components.noc import NoC, Topo
+        noc = NoC(16, Topo.MESH, list(range(8)))
+        access = record("read", 1, 1024)
+        access["requester_core_weights"] = [[7, 1024]]
+        values = {}
+        for cf in ("none", "ideal_dram", "ideal_dram_noc"):
+            dram = make_dram(banks=2, channels=2)
+            dram.execution_options = {"counterfactual": cf}
+            session = dram.new_execution_session(placement_policy="uniform", noc=noc)
+            values[cf] = session.schedule_records([access], 0).read
+        self.assertGreater(values["none"].noc_byte_hops, 0)
+        self.assertEqual(values["ideal_dram"].cycles, values["none"].noc_cycles)
+        self.assertEqual(values["ideal_dram_noc"].cycles, values["none"].dram_cycles)
+        self.assertEqual(len({v.noc_byte_hops for v in values.values()}), 1)
+
+    def test_operator_scoped_counterfactual_retains_other_stages(self):
+        records = [record("read", 1, 1024)]
+        session = self.session(make_dram(), counterfactual="ideal_dram", counterfactual_op_indices=[1])
+        self.assertGreater(session.schedule_records(records, 0).read.dram_cycles, 0)
+        self.assertEqual(session.schedule_records(records, 1).read.dram_cycles, 0)
+        self.assertGreater(session.schedule_records(records, 2).read.dram_cycles, 0)

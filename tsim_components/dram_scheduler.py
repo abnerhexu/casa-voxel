@@ -63,7 +63,7 @@ class DRAMStageStats:
     resource: dict = field(default_factory=dict)
     trace: list = field(default_factory=list)
 
-    def as_dict(self) -> Dict[str, int]:
+    def as_dict(self) -> Dict[str, object]:
         return {
             "cycles": int(self.cycles),
             "dram_cycles": int(self.dram_cycles),
@@ -295,9 +295,9 @@ class DRAMExecutionSession:
 
     Open-row state persists between fused operators.  Each read or write
     stage starts a fresh relative timing window because the outer TSim
-    scheduler assigns its absolute start time.  A bounded hit-first window is
-    used as a lightweight FR-FCFS approximation; no tRAS constraint is
-    modelled.
+    scheduler assigns its absolute start time. The default bounded policy
+    selects earliest-ready, using a row hit only to break ties. No tRAS
+    constraint is modelled. Optional controls retain the same stage boundary.
     """
 
     def __init__(
@@ -370,9 +370,21 @@ class DRAMExecutionSession:
             saved = self.frozen["operations"][str(op_index)]
             if saved["logical_hash"] != self.logical_hash(records):
                 raise ValueError("frozen replay logical access mismatch")
-            return [DRAMRowRun(**{
+            frozen_runs = [DRAMRowRun(**{
                 **run, "channel_id": geometry.decode_bank(run["bank_id"])[0]
-            }) for run in saved["runs"]], plan
+            }) for run in saved["runs"]]
+            per_record_bytes = [0] * len(records)
+            for run in frozen_runs:
+                if (not 0 <= run.record_index < len(records) or run.row_count < 1 or
+                        run.num_bytes < 1 or run.row_start < 0 or not 0 <= run.bank_id < geometry.total_banks):
+                    raise ValueError("invalid frozen row run")
+                placement = plan.get(record_signature(records[run.record_index]))
+                if placement is None or run.bank_id not in placement.bank_ids:
+                    raise ValueError("frozen row run is outside tensor bank placement")
+                per_record_bytes[run.record_index] += run.num_bytes
+            if per_record_bytes != [record_bytes(r) for r in records]:
+                raise ValueError("frozen row runs do not conserve logical bytes")
+            return frozen_runs, plan
         missing = {
             record_signature(record) for record in records
             if record_bytes(record) > 0
@@ -454,6 +466,8 @@ class DRAMExecutionSession:
         self.snapshot.update(geometry=geometry_key,
                              logical_hash=self.logical_hash(access_records))
         if self.frozen is not None:
+            if self.frozen.get("version") != 1:
+                raise ValueError("unsupported frozen replay version")
             if (self.frozen["geometry"] != geometry_key or
                     self.frozen["logical_hash"] != self.snapshot["logical_hash"]):
                 raise ValueError("frozen replay geometry/logical input mismatch")
@@ -467,6 +481,8 @@ class DRAMExecutionSession:
                     self.placement_policy, banks,
                     tuple(sorted({geometry.decode_bank(b)[0] for b in banks})))
                 self._tensor_addresses[signature] = int(entry["address"])
+                if entry["address"] < 0:
+                    raise ValueError("negative frozen allocation address")
                 capacity = getattr(self.dram, "capacity_bytes", None)
                 if capacity is not None and entry["address"] + allocation_bytes(entry["record"]) > capacity:
                     raise ValueError("frozen allocation exceeds capacity")
@@ -586,6 +602,7 @@ class DRAMExecutionSession:
         input_indices = list(range(len(runs)))
         bypasses = [0] * len(runs)
         decisions = 0
+        first_visible = {}
         bank_free = [0] * int(self.dram.geometry.total_banks)
         channel_free = [0] * int(self.dram.geometry.num_channels)
         record_start: Dict[int, int] = {}
@@ -630,6 +647,9 @@ class DRAMExecutionSession:
                 return ready, 0 if candidate_hit else 1, candidate
 
             eligible = list(range(min(self.frfcfs_window, len(pending))))
+            if self.trace_enabled:
+                for index in eligible:
+                    first_visible.setdefault(input_indices[index], decisions)
             if self.fixed_bank_order:
                 seen = set()
                 heads = []
@@ -692,6 +712,7 @@ class DRAMExecutionSession:
                 events.append({**asdict(run), "input_index": input_index,
                                "selection_reason": reason, "bypass_count": bypass_count,
                                "decision_index": decisions,
+                               "visible_decision": first_visible[input_index],
                                "release": 0, "bank_start": bank_free[run.bank_id],
                                "row_ready": row_ready, "transfer_start": transfer_start,
                                "finish": finish, "hits": hits, "misses": misses,
@@ -729,9 +750,13 @@ class DRAMExecutionSession:
                 "unclassified_idle": channels * stats.cycles - sum(channel_busy) - tail,
                 "bank_busy_integral": bank_busy_integral,
                 "service_events": decisions,
+                "input_row_touches": sum(run.row_count for run in runs),
             }
             if self.trace_enabled:
                 stats.trace = events
+                stats.resource["stage_release_to_bus_start_p95"] = float(np.percentile(
+                    [event["transfer_start"] for event in events], 95))
+                stats.resource["wait_sample_unit"] = "serviced_row_chunk"
         for record_index, counts in record_counts.items():
             record = records[record_index]
             record["row_hits"] = int(counts[0])
