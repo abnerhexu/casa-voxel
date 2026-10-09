@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
                         help="HBM package footprint aspect ratio as width/height.")
     parser.add_argument("--hbm-banks-per-package", type=int, default=16,
                         help="Number of pseudochannel-aligned thermal bank blocks inside each HBM package in bank granularity.")
+    parser.add_argument("--dram-num-channels", type=int, default=1,
+                        help="Logical DRAM channels used by channel-aware bank placement.")
     parser.add_argument("--hbm-interleave-stripe-bytes", type=int, default=256,
                         help="Stripe size for address_trace and hbm_interleave DRAM bank mapping.")
     parser.add_argument("--dram-floorplan-granularity", choices=("package", "bank"), default="bank",
@@ -67,7 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dram-bank-mapping",
                         choices=("address_trace", "hbm_interleave", "hbm-interleave",
                                  "fine_interleave", "fine-interleave", "bank_interleave", "bank-interleave",
-                                 "from_impl", "uniform", "interleave_size", "software_aware"),
+                                 "from_impl", "uniform", "interleave_size", "software_aware",
+                                 "channel_aware", "channel-aware"),
                         default="address_trace",
                         help="DRAM bank placement policy used for bank-level thermal attribution.")
     parser.add_argument("--dram-bank-mappings", default="",
@@ -158,6 +161,7 @@ def validate_args(args: argparse.Namespace) -> List[str]:
         "hbm_package_area_mm2",
         "hbm_package_aspect_ratio",
         "hbm_banks_per_package",
+        "dram_num_channels",
         "throttle_c",
         "simple_r_k_per_w",
         "simple_c_j_per_k",
@@ -207,6 +211,7 @@ def validate_args(args: argparse.Namespace) -> List[str]:
         "address_trace", "hbm_interleave", "hbm-interleave",
         "fine_interleave", "fine-interleave", "bank_interleave", "bank-interleave",
         "from_impl", "uniform", "interleave_size", "software_aware",
+        "channel_aware", "channel-aware",
     }
     if args.dram_bank_mappings:
         invalid = sorted(
@@ -240,6 +245,7 @@ def make_trace_config(
         hbm_package_area_mm2=args.hbm_package_area_mm2,
         hbm_package_aspect_ratio=args.hbm_package_aspect_ratio,
         hbm_banks_per_package=args.hbm_banks_per_package,
+        dram_num_channels=args.dram_num_channels,
         hbm_interleave_stripe_bytes=args.hbm_interleave_stripe_bytes,
         dram_floorplan_granularity=args.dram_floorplan_granularity,
         dram_bank_mapping=dram_bank_mapping or args.dram_bank_mapping,
@@ -332,6 +338,7 @@ def row_from_result(artifact, trace_cfg, trace, result, package_dir: Path, backe
         "dram_floorplan_granularity": trace_cfg.dram_floorplan_granularity,
         "dram_bank_mapping": resolve_dram_bank_mapping(trace_cfg, artifact),
         "hbm_banks_per_package": trace_cfg.hbm_banks_per_package,
+        "dram_num_channels": trace_cfg.dram_num_channels,
         "logic_floorplan": trace_cfg.logic_floorplan,
         "noc_power_backend": trace_cfg.noc_power_backend,
         "noc_power_flit_bits": trace_cfg.noc_power_flit_bits,

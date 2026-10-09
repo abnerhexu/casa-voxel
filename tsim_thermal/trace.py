@@ -18,6 +18,12 @@ from tsim_components.mem import (
     get_hbm_package_footprint_mm,
     get_per_cycle_bytes_per_core_from_DRAM_config,
 )
+from tsim_components.dram_placement import (
+    SUPPORTED_DRAM_PLACEMENTS,
+    channel_aware_placements,
+    record_signature as shared_record_signature,
+    software_aware_placements,
+)
 from tsim_components.noc_power import (
     NoCPowerConfig,
     describe as describe_noc_power,
@@ -55,6 +61,7 @@ class TraceConfig:
     hbm_package_area_mm2: float = HBM_PACKAGE_AREA_MM2
     hbm_package_aspect_ratio: float = 1.0
     hbm_banks_per_package: int = 16
+    dram_num_channels: int = 1
     hbm_interleave_stripe_bytes: int = 256
     dram_floorplan_granularity: str = "bank"
     dram_bank_mapping: str = "address_trace"
@@ -1202,6 +1209,8 @@ def resolve_dram_bank_mapping(cfg: TraceConfig, artifact: RunArtifacts | None = 
         "software": "software_aware",
         "program_aware": "software_aware",
         "program-aware": "software_aware",
+        "channel-aware": "channel_aware",
+        "channel": "channel_aware",
         "uniform_dram": "uniform",
         "uniform_placement": "uniform",
         "interleave": "interleave_size",
@@ -1217,7 +1226,7 @@ def resolve_dram_bank_mapping(cfg: TraceConfig, artifact: RunArtifacts | None = 
     if mapping == "from_impl":
         impl = str(getattr(getattr(artifact, "run_id", None), "impl", "")).lower()
         return aliases.get(impl, "software_aware")
-    if mapping not in {"address_trace", "hbm_interleave", "uniform", "interleave_size", "software_aware"}:
+    if mapping not in SUPPORTED_DRAM_PLACEMENTS:
         return "hbm_interleave"
     return mapping
 
@@ -1413,37 +1422,7 @@ def _all_dram_access_records(meta: dict) -> List[dict]:
 
 
 def _record_signature(record: dict) -> Tuple[int, int, str, str]:
-    return (
-        int(record.get("subop_index", 0) or 0),
-        int(record.get("tensor_index", 0) or 0),
-        str(record.get("tensor_role", "tensor")),
-        str(record.get("stage", "")),
-    )
-
-
-def _span_count_from_weights(items: List[Tuple[int, float]], total_banks: int) -> Dict[int, int]:
-    total_banks = max(1, int(total_banks))
-    positive = [(idx, max(0.0, float(weight))) for idx, weight in items]
-    total_weight = sum(weight for _idx, weight in positive)
-    if total_weight <= 0:
-        return {idx: 1 for idx, _weight in positive}
-    raw = [(idx, total_banks * weight / total_weight) for idx, weight in positive]
-    spans = {idx: max(1, int(math.floor(value))) for idx, value in raw}
-    current = sum(spans.values())
-    if current > total_banks:
-        for idx, _value in sorted(raw, key=lambda item: item[1]):
-            if current <= total_banks:
-                break
-            if spans[idx] > 1:
-                spans[idx] -= 1
-                current -= 1
-    elif current < total_banks:
-        for idx, _value in sorted(raw, key=lambda item: item[1] - math.floor(item[1]), reverse=True):
-            if current >= total_banks:
-                break
-            spans[idx] += 1
-            current += 1
-    return spans
+    return shared_record_signature(record)
 
 
 def _contiguous_bank_weights(start_bank: int, span: int, total_banks: int, total_bytes: int) -> Dict[int, float]:
@@ -1457,26 +1436,6 @@ def _contiguous_bank_weights(start_bank: int, span: int, total_banks: int, total
         (int(start_bank) + offset) % total_banks: bytes_per_bank
         for offset in range(span)
     }
-
-
-def _software_aware_record_assignments(meta: dict, total_banks: int, op_seed: int) -> Dict[Tuple[int, int, str, str], Tuple[int, int]]:
-    records = _all_dram_access_records(meta)
-    if not records:
-        return {}
-    ordered = sorted(records, key=_record_signature)
-    items = [
-        (idx, float(record.get("total_bytes") or record.get("bytes_per_core") or 1))
-        for idx, record in enumerate(ordered)
-    ]
-    spans = _span_count_from_weights(items, total_banks)
-    start = int(op_seed) % max(1, total_banks)
-    assignments: Dict[Tuple[int, int, str, str], Tuple[int, int]] = {}
-    cursor = start
-    for idx, record in enumerate(ordered):
-        span = spans.get(idx, 1)
-        assignments[_record_signature(record)] = (cursor, span)
-        cursor += span
-    return assignments
 
 
 def dram_mapping_record_events(
@@ -1504,10 +1463,20 @@ def dram_mapping_record_events(
     stage_start = int(getattr(op, "t_dram_ld_start" if kind == "read" else "t_dram_st_start", 0))
     stage_duration = int(getattr(op, "dram_ld_dur" if kind == "read" else "dram_st_dur", 0))
     max_record_bytes = max(1, max(int(record.get("total_bytes") or record.get("bytes_per_core") or 1) for record in _all_dram_access_records(meta) or records))
-    software_assignments = (
-        _software_aware_record_assignments(meta, total_banks, op_id * 131 + op_position * 17)
-        if mapping == "software_aware"
-        else {}
+    placement_seed = op_id * 131 + op_position * 17
+    all_records = _all_dram_access_records(meta) or records
+    software_plan = (
+        software_aware_placements(all_records, total_banks, placement_seed)
+        if mapping == "software_aware" else {}
+    )
+    channel_plan = (
+        channel_aware_placements(
+            all_records,
+            total_banks,
+            max(1, int(cfg.dram_num_channels)),
+            placement_seed,
+        )
+        if mapping == "channel_aware" else {}
     )
 
     events: List[Dict[str, Any]] = []
@@ -1533,8 +1502,14 @@ def dram_mapping_record_events(
             start_bank = int(seed % total_banks)
             bank_weights = _contiguous_bank_weights(start_bank, span, total_banks, total_bytes)
         elif mapping == "software_aware":
-            start_bank, span = software_assignments.get(_record_signature(record), (op_id % total_banks, total_banks))
-            bank_weights = _contiguous_bank_weights(start_bank, span, total_banks, total_bytes)
+            placement = software_plan.get(_record_signature(record))
+            bank_weights = (
+                placement.bank_weights(total_bytes) if placement else
+                _contiguous_bank_weights(op_id % total_banks, total_banks, total_banks, total_bytes)
+            )
+        elif mapping == "channel_aware":
+            placement = channel_plan.get(_record_signature(record))
+            bank_weights = placement.bank_weights(total_bytes) if placement else {}
         else:
             continue
 
@@ -1546,6 +1521,13 @@ def dram_mapping_record_events(
             "duration_cycle": max(0, duration_cycle),
             "stripe_bytes": stripe_bytes,
             "bank_weights": bank_weights,
+            "channel_weights": {
+                channel: sum(
+                    float(weight) for bank, weight in bank_weights.items()
+                    if int(bank) % max(1, int(cfg.dram_num_channels)) == channel
+                )
+                for channel in range(max(1, int(cfg.dram_num_channels)))
+            },
             "unit_weights": _dram_unit_weights_from_bank_weights(bank_weights, cfg),
             "bank_mapping": mapping,
         })

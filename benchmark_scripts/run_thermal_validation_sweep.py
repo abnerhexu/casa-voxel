@@ -45,12 +45,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hbm-package-area-mm2", type=float, default=87.62745402745404)
     parser.add_argument("--hbm-package-aspect-ratio", type=float, default=1.0)
     parser.add_argument("--hbm-banks-per-package", type=int, default=16)
+    parser.add_argument("--dram-num-channels", type=int, default=1)
     parser.add_argument("--hbm-interleave-stripe-bytes", type=int, default=256)
     parser.add_argument("--dram-floorplan-granularity", choices=("package", "bank"), default="bank")
     parser.add_argument("--dram-bank-mapping",
                         choices=("address_trace", "hbm_interleave", "hbm-interleave",
                                  "fine_interleave", "fine-interleave", "bank_interleave", "bank-interleave",
-                                 "from_impl", "uniform", "interleave_size", "software_aware"),
+                                 "from_impl", "uniform", "interleave_size", "software_aware",
+                                 "channel_aware", "channel-aware"),
                         default="address_trace")
     parser.add_argument("--dram-bank-mappings", default="")
     parser.add_argument("--thermal-backends", default="simple")
@@ -178,6 +180,7 @@ def main() -> int:
         "--hbm-package-area-mm2", str(args.hbm_package_area_mm2),
         "--hbm-package-aspect-ratio", str(args.hbm_package_aspect_ratio),
         "--hbm-banks-per-package", str(args.hbm_banks_per_package),
+        "--dram-num-channels", str(args.dram_num_channels),
         "--hbm-interleave-stripe-bytes", str(args.hbm_interleave_stripe_bytes),
         "--dram-floorplan-granularity", args.dram_floorplan_granularity,
         "--dram-bank-mapping", args.dram_bank_mapping,

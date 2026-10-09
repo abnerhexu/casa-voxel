@@ -54,11 +54,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hbm-package-capacity-gb", type=float, default=16.0)
     parser.add_argument("--hbm-package-area-mm2", type=float, default=87.62745402745404)
     parser.add_argument("--hbm-banks-per-package", type=int, default=16)
+    parser.add_argument("--dram-num-channels", type=int, default=1)
     parser.add_argument("--hbm-interleave-stripe-bytes", type=int, default=256)
     parser.add_argument("--dram-bank-mapping",
                         choices=("address_trace", "hbm_interleave", "hbm-interleave",
                                  "fine_interleave", "fine-interleave", "bank_interleave", "bank-interleave",
-                                 "from_impl", "uniform", "interleave_size", "software_aware"),
+                                 "from_impl", "uniform", "interleave_size", "software_aware",
+                                 "channel_aware", "channel-aware"),
                         default="address_trace")
     parser.add_argument("--noc-power-backend", choices=("tsim_simple", "simple", "dsent", "orion"), default="tsim_simple")
     parser.add_argument("--noc-power-flit-bits", type=int, default=64)
@@ -411,6 +413,7 @@ def main() -> int:
         hbm_package_capacity_mb=int(round(args.hbm_package_capacity_gb * 1024)),
         hbm_package_area_mm2=args.hbm_package_area_mm2,
         hbm_banks_per_package=args.hbm_banks_per_package,
+        dram_num_channels=args.dram_num_channels,
         hbm_interleave_stripe_bytes=args.hbm_interleave_stripe_bytes,
         dram_floorplan_granularity="bank",
         dram_bank_mapping=args.dram_bank_mapping,

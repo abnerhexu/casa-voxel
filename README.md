@@ -250,6 +250,12 @@ change the number of transactions or row conflicts. The internal precise path
 returns the completion time of the slowest channel. Multi-channel runs use
 this internal path even when an external single-channel backend was requested.
 
+The independent `channel_aware` placement policy extends `software_aware` with
+explicit channel load balancing. It assigns large tensor records first to the
+least-loaded channels, selects deterministic bank stripes inside each channel,
+and maintains separate read/write cursors. A channel-count sweep therefore
+recomputes placement while retaining the selected spatial/temporal tiling.
+
 ### 3.4 Generate Figures (Figs 10–20)
 
 Once simulation data is ready (verify with the dry-run in Section 3.3), each
