@@ -241,6 +241,15 @@ the total bank count is evenly divisible by the channel count and provides a
 single bank numbering scheme shared by timing, conflict, and placement code.
 Older configurations containing only `num_banks_per_channel` remain accepted.
 
+`bytes_per_cycle` is the aggregate per-core service rate across the complete
+DRAM. Under a fixed total-bandwidth budget, each channel receives
+`bytes_per_cycle / num_channels`; channels own independent data buses and run
+concurrently. `transaction_bytes` (128 B by default) controls request and row-
+segment granularity only, so changing sustained bandwidth cannot silently
+change the number of transactions or row conflicts. The internal precise path
+returns the completion time of the slowest channel. Multi-channel runs use
+this internal path even when an external single-channel backend was requested.
+
 ### 3.4 Generate Figures (Figs 10–20)
 
 Once simulation data is ready (verify with the dry-run in Section 3.3), each

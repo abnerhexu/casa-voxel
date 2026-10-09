@@ -22,6 +22,7 @@ class DRAMRowConflictEnergyTest(unittest.TestCase):
             bytes_per_cycle=16,
             num_cores=4,
             num_banks_per_channel=banks,
+            transaction_bytes=16,
             use_sram=use_sram,
         )
 
@@ -58,6 +59,7 @@ class DRAMRowConflictEnergyTest(unittest.TestCase):
             CL=14, tRCD=14, tRP=14,
             bytes_per_row=256, bytes_per_cycle=16,
             num_cores=256, num_banks_per_channel=4,
+            transaction_bytes=16,
         )
         tensors = [np.array([64, 64]), np.array([64, 64])]
         common = dict(

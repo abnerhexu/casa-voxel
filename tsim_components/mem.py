@@ -340,7 +340,13 @@ class DRAM:
 
         self.geometry: DRAMGeometry = geometry
         self.bytes_per_row: int = int(geometry.bytes_per_row)
-        self.bytes_per_cycle: int = bytes_per_cycle
+        # Aggregate per-core service rate across all channels.  Keep the
+        # historical attribute name as an alias because a large part of TSim
+        # reads it directly.
+        self.total_bytes_per_cycle: float = float(bytes_per_cycle)
+        if self.total_bytes_per_cycle <= 0:
+            raise ValueError("bytes_per_cycle must be positive")
+        self.bytes_per_cycle: float = self.total_bytes_per_cycle
         self.num_cores: int = num_cores
         self.num_layers: int = int(geometry.num_layers)
         self.banks_per_layer: int = int(geometry.banks_per_layer)
@@ -393,6 +399,20 @@ class DRAM:
         self._ultra_cache: Dict[Tuple[int, int, bool], int] = {}
         if self.ultra_precise:
             self._populate_from_dram_cache()
+
+    @property
+    def channel_bytes_per_cycle(self) -> float:
+        """Per-channel service rate under the fixed total-bandwidth budget."""
+        return self.total_bytes_per_cycle / self.num_channels
+
+    def bandwidth_geometry(self) -> Dict[str, float]:
+        """Return the decoupled aggregate/channel bandwidth description."""
+        return {
+            "total_bytes_per_cycle": self.total_bytes_per_cycle,
+            "channel_bytes_per_cycle": self.channel_bytes_per_cycle,
+            "num_channels": self.num_channels,
+            "transaction_bytes": self.transaction_bytes,
+        }
 
     def _populate_from_dram_cache(self) -> None:
         """Populate ultra cache from pre-computed dram_cache files (``*.dcache``).
@@ -483,6 +503,13 @@ class DRAM:
             # SRAM-only design points (empirical ~3.57 bytes/cycle).
             return int(num_bytes / 3.57)
         if self.ultra_precise:
+            # External backends currently accept one isolated-channel trace.
+            # Use the internal channel-aware path for multi-channel geometry
+            # so concurrency is not lost.
+            if self.num_channels > 1:
+                return self._precise_num_cycle_of_access(
+                    num_bytes, access_granularity_bytes, need_init
+                )
             return self._ultra_precise_num_cycle_of_access(num_bytes,
                                                            access_granularity_bytes,
                                                            need_init)
@@ -509,7 +536,13 @@ class DRAM:
             max_access_granularity = min(access_granularity_bytes, self.bytes_per_row)
             num_reopen = 1 / (max_access_granularity // num_bytes)
 
-        cycle += num_reopen * self.reopen
+        # Row work on different channels can proceed independently. The
+        # slowest channel receives the ceiling of the striped reopen count.
+        if num_reopen < 1:
+            channel_reopens = num_reopen
+        else:
+            channel_reopens = ceil(num_reopen / self.num_channels)
+        cycle += channel_reopens * self.reopen
 
         # --- Bank contention scaling ---
         # Multiple cores sharing the same bank serialize their row activations.
@@ -545,13 +578,13 @@ class DRAM:
         if num_bytes <= 0 or self.use_sram:
             return 0
 
-        bytes_per_burst = max(1, int(self.bytes_per_cycle))
+        bytes_per_burst = max(1, int(self.transaction_bytes))
         bytes_per_row = max(bytes_per_burst, int(self.bytes_per_row))
         granularity = max(
             bytes_per_burst,
             min(int(access_granularity_bytes), bytes_per_row),
         )
-        bursts_per_chunk = max(1, granularity // bytes_per_burst)
+        bursts_per_chunk = max(1, ceil(granularity / bytes_per_burst))
         num_bursts = (int(num_bytes) + bytes_per_burst - 1) // bytes_per_burst
         num_chunks = (num_bursts + bursts_per_chunk - 1) // bursts_per_chunk
         num_banks = max(1, int(self.num_banks))
@@ -615,74 +648,97 @@ class DRAM:
         """Drive the per-bank state machine over a synthetic burst stream.
 
         Address layout assumption: each ``access_granularity``-sized chunk
-        opens a fresh row, and chunks round-robin across the banks of a
-        single channel. This captures both the worst case of granularity
-        forcing reopens and the best case of spreading over independent
-        banks.
+        opens a fresh row, chunks round-robin across all physical banks, and
+        global banks are interleaved across channels. Each channel has an
+        independent data bus whose bandwidth is the fixed total bandwidth
+        divided by the number of channels. The access completes when its
+        slowest channel completes.
         """
-        # Cast to int up front: bytes_per_cycle / bytes_per_row may be float
-        # when derived from `total_GBps * 2^30 / freq / 1e6 // num_cores`
-        # (`//` on floats returns float).
-        bpc = max(1, int(self.bytes_per_cycle))
-        bpr = max(bpc, int(self.bytes_per_row))
+        transaction_bytes = max(1, int(self.transaction_bytes))
+        bpr = max(transaction_bytes, int(self.bytes_per_row))
         # Each chunk maps to one row. Don't let granularity exceed a row
         # (would imply spanning multiple rows in one chunk — not modelled).
-        ag_eff = max(bpc, min(int(access_granularity), bpr))
-        bursts_per_chunk = max(1, ag_eff // bpc)
-        num_bursts = max(1, (int(num_bytes) + bpc - 1) // bpc)
+        ag_eff = max(transaction_bytes, min(int(access_granularity), bpr))
+        bursts_per_chunk = max(1, ceil(ag_eff / transaction_bytes))
+        num_bursts = max(1, ceil(int(num_bytes) / transaction_bytes))
         num_chunks = (num_bursts + bursts_per_chunk - 1) // bursts_per_chunk
 
-        NB = max(1, self.num_banks)
-        # Bank state: open row id (-1 = closed) and earliest free time.
-        bank_open_row: List[int] = [-1] * NB
-        bank_free_time: List[int] = [0] * NB
-        last_act_per_bank: List[int] = [-self.tRRD] * NB
-        # Sliding window of last activations for tFAW (length <= 4).
-        act_window: List[int] = []
-        bus_free_time: int = 0
-        cur_time: int = 0
+        total_banks = max(1, self.num_banks)
+        banks_per_channel = self.geometry.banks_per_channel
+        # Per-channel bank state and independent shared data buses.
+        bank_open_row: List[List[int]] = [
+            [-1] * banks_per_channel for _ in range(self.num_channels)
+        ]
+        bank_free_time: List[List[int]] = [
+            [0] * banks_per_channel for _ in range(self.num_channels)
+        ]
+        last_act_per_bank: List[List[int]] = [
+            [-self.tRRD] * banks_per_channel for _ in range(self.num_channels)
+        ]
+        act_windows: List[List[int]] = [[] for _ in range(self.num_channels)]
+        bus_free_time: List[int] = [0] * self.num_channels
 
         # If continuing from a previously open row, pre-open bank 0 row 0
         # so the first chunk hits without paying the activation penalty.
         if not need_init:
-            bank_open_row[0] = 0
+            bank_open_row[0][0] = 0
 
         for chunk_idx in range(num_chunks):
-            bank = chunk_idx % NB
-            row = (chunk_idx // NB) + 1  # synthetic row id (>= 1)
+            global_bank = chunk_idx % total_banks
+            channel, bank, _layer, _bank_in_layer = \
+                self.geometry.decode_bank(global_bank)
+            row = chunk_idx // total_banks
             bursts_remaining = num_bursts - chunk_idx * bursts_per_chunk
             bursts_this = min(bursts_per_chunk, bursts_remaining)
+            bytes_remaining = int(num_bytes) - chunk_idx * bursts_per_chunk * transaction_bytes
+            bytes_this = min(
+                max(0, bytes_remaining),
+                bursts_this * transaction_bytes,
+            )
 
-            if bank_open_row[bank] != row:
+            if bank_open_row[channel][bank] != row:
                 # Need (precharge if open) + activate + tRCD before CAS.
-                t_ready = max(cur_time, bank_free_time[bank])
-                if bank_open_row[bank] != -1:
+                t_ready = bank_free_time[channel][bank]
+                if bank_open_row[channel][bank] != -1:
                     t_pre_done = t_ready + self.tRP
                 else:
                     t_pre_done = t_ready
                 # tRRD: min interval to previous activation on this bank.
-                t_act = max(t_pre_done, last_act_per_bank[bank] + self.tRRD)
-                # tFAW: at most 4 activations within tFAW cycles globally.
+                t_act = max(
+                    t_pre_done,
+                    last_act_per_bank[channel][bank] + self.tRRD,
+                )
+                # tFAW is enforced independently by each channel.
+                act_window = act_windows[channel]
                 if len(act_window) >= 4:
                     t_act = max(t_act, act_window[-4] + self.tFAW)
                 act_window.append(t_act)
                 if len(act_window) > 4:
                     # Keep only the trailing four — that's all tFAW needs.
-                    act_window = act_window[-4:]
-                last_act_per_bank[bank] = t_act
-                bank_open_row[bank] = row
+                    act_windows[channel] = act_window[-4:]
+                last_act_per_bank[channel][bank] = t_act
+                bank_open_row[channel][bank] = row
                 t_cas_cmd = t_act + self.tRCD
             else:
                 # Row hit — go straight to CAS.
-                t_cas_cmd = max(cur_time, bank_free_time[bank])
+                t_cas_cmd = bank_free_time[channel][bank]
 
-            # First data beat appears tCL after CAS; subsequent beats are
-            # one per cycle. Bus serializes across banks.
-            t_data_first = max(t_cas_cmd + self.CL, bus_free_time)
-            t_data_last = t_data_first + bursts_this  # exclusive end
-            bus_free_time = t_data_last
-            bank_free_time[bank] = t_data_last
-            cur_time = t_data_last
+            # The 128-byte transaction size is independent from bandwidth.
+            # A channel may therefore need multiple cycles to transfer one
+            # transaction when the channel count is increased under a fixed
+            # aggregate bandwidth budget.
+            transfer_cycles = max(
+                1, ceil(bytes_this / self.channel_bytes_per_cycle)
+            )
+            t_data_first = max(
+                t_cas_cmd + self.CL,
+                bus_free_time[channel],
+            )
+            t_data_last = t_data_first + transfer_cycles
+            bus_free_time[channel] = t_data_last
+            bank_free_time[channel][bank] = t_data_last
+
+        cur_time = max(bus_free_time, default=0)
 
         # Amortized refresh: the fraction of time spent in tRFC stalls.
         # A real DRAM stalls one rank for tRFC cycles every tREFI cycles;
