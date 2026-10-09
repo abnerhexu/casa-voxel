@@ -148,6 +148,11 @@ def get_hw_modules( hw_config, num_cores,
         "num_channels": int(dram_info.get("num_channels", 1)),
         "transaction_bytes": int(dram_info.get("transaction_bytes", 128)),
     }
+    capacity_bytes = dram_info.get("capacity_bytes")
+    if capacity_bytes is None and "capacity_GB" in dram_info:
+        capacity_bytes = int(float(dram_info["capacity_GB"]) * 1024**3)
+    if capacity_bytes is None and "capacity_MB" in dram_info:
+        capacity_bytes = int(float(dram_info["capacity_MB"]) * 1024**2)
     # Preserve old configs which used one isolated bank-count parameter.
     if "num_banks_per_channel" in dram_info and not any(
         key in dram_info for key in ("banks_per_layer", "num_channels")
@@ -188,6 +193,7 @@ def get_hw_modules( hw_config, num_cores,
                 use_sram=use_sram,
                 lock_cores_per_bank=lock_cores_per_bank,
                 soft_cores_per_bank=soft_cores_per_bank,
+                capacity_bytes=capacity_bytes,
                 **geometry_kwargs,
                 **dram_kwargs)
 
@@ -489,6 +495,7 @@ if __name__ == "__main__":
     dram_util = []
     noc_traffic_hops = []
     dram_conflict_stats = []
+    experiment_records = []
     overlap_lists = []
 
     # Build one parameter tuple per candidate execution-space partition.
@@ -572,6 +579,7 @@ if __name__ == "__main__":
             stats["dram_base_energy"],
             stats["dram_row_conflict_energy"],
         ))
+        experiment_records.append(stats["experiment"])
         overlap_lists.append(overlap_list)
         logs.append(log)
 
@@ -595,4 +603,5 @@ if __name__ == "__main__":
                     ipu_tsim=args.ipu_tsim,
                     dataflow=args.dataflow,
                     noc_traffic_hops=noc_traffic_hops,
-                    dram_conflict_stats=dram_conflict_stats)
+                    dram_conflict_stats=dram_conflict_stats,
+                    experiment_records=experiment_records)

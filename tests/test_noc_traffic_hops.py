@@ -200,6 +200,8 @@ class NoCTrafficHopsTest(unittest.TestCase):
         self.assertEqual(stats["noc_shift_byte_hops"], 360.0)
         self.assertEqual(stats["noc_reduce_byte_hops"], 100.0)
         self.assertEqual(logs[0].noc_byte_hops, 760.0)
+        self.assertEqual(stats["experiment"]["metrics"]["noc_byte_hops"]["total"], 760.0)
+        self.assertEqual(len(stats["experiment"]["tiling"]), 1)
 
 
 if __name__ == "__main__":

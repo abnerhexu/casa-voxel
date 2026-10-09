@@ -1,0 +1,298 @@
+"""Versioned, machine-readable output for architecture experiments."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+
+EXPERIMENT_SCHEMA_VERSION = 1
+
+
+def _json_value(value: Any) -> Any:
+    """Convert numpy/enums/tuples and other scalar wrappers to JSON values."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_value(item) for item in value]
+    if hasattr(value, "item"):
+        return _json_value(value.item())
+    if hasattr(value, "value"):
+        return _json_value(value.value)
+    return str(value)
+
+
+def _operator_record(log: object, tiling: Mapping[str, Any] | None) -> dict:
+    meta = getattr(log, "spatial_meta", {}) or {}
+    accesses = meta.get("dram_access_records", []) or []
+    banks = sorted({
+        int(bank)
+        for access in accesses
+        for bank in (access.get("bank_ids", []) or [])
+    })
+    channels = sorted({
+        int(channel)
+        for access in accesses
+        for channel in (access.get("channel_ids", []) or [])
+    })
+    return {
+        "operator_index": int(getattr(log, "op_id", 0)),
+        "tiling": _json_value(tiling or {}),
+        "timing_cycles": {
+            "start": int(getattr(log, "t_dram_ld_start", 0)),
+            "finish": int(getattr(log, "t_finish", 0)),
+            "dram_read": int(getattr(log, "dram_ld_dur", 0)),
+            "dram_write": int(getattr(log, "dram_st_dur", 0)),
+            "noc_broadcast": int(getattr(log, "bcast_dur", 0)),
+            "noc_shift": int(getattr(log, "shift_dur", 0)),
+            "noc_reduce": int(getattr(log, "reduce_dur", 0)),
+            "compute": int(getattr(log, "comp_dur", 0)),
+        },
+        "dram_bytes": {
+            "read": int(getattr(log, "dram_r_bytes", 0)),
+            "write": int(getattr(log, "dram_w_bytes", 0)),
+        },
+        "row_buffer": {
+            "read": {
+                "hits": int(getattr(log, "dram_r_row_hits", 0)),
+                "misses": int(getattr(log, "dram_r_row_misses", 0)),
+                "conflicts": int(getattr(log, "dram_r_row_conflicts", 0)),
+            },
+            "write": {
+                "hits": int(getattr(log, "dram_w_row_hits", 0)),
+                "misses": int(getattr(log, "dram_w_row_misses", 0)),
+                "conflicts": int(getattr(log, "dram_w_row_conflicts", 0)),
+            },
+        },
+        "dram_dynamic_energy_pj": {
+            "base_transfer": float(getattr(log, "energy_dram_base", 0.0)),
+            "row_conflict_act_pre": float(
+                getattr(log, "energy_dram_row_conflict", 0.0)
+            ),
+            "total": float(getattr(log, "energy_dram", 0.0)),
+        },
+        "noc_byte_hops": {
+            "broadcast": float(getattr(log, "noc_bcast_byte_hops", 0.0)),
+            "shift": float(getattr(log, "noc_shift_byte_hops", 0.0)),
+            "reduce": float(getattr(log, "noc_reduce_byte_hops", 0.0)),
+            "total": float(getattr(log, "noc_byte_hops", 0.0)),
+        },
+        "placement": {
+            "policy": str(getattr(log, "dram_placement_policy", "unknown")),
+            "bank_ids": banks,
+            "channel_ids": channels,
+            "access_record_count": len(accesses),
+        },
+    }
+
+
+def build_experiment_record(
+    *,
+    workload_name: str,
+    hardware: object,
+    stats: Mapping[str, Any],
+    operator_logs: Sequence[object],
+    partitions: Sequence[tuple],
+    operator_names: Sequence[str],
+    placement_policy: str,
+    total_layers: int,
+    simulated_layers: int,
+    tiling_cache: Mapping[str, Any] | None = None,
+) -> dict:
+    """Build one complete L1-ready result record for a design point."""
+    dram = hardware.mem
+    comp = hardware.comp
+    noc = hardware.noc
+    topology = getattr(getattr(noc, "topology", None), "value", None)
+    if topology is None:
+        topology = str(getattr(noc, "topology", "unknown"))
+
+    tilings = []
+    for index, ((temporal, spatial), name) in enumerate(
+        zip(partitions, operator_names)
+    ):
+        tilings.append({
+            "operator_index": int(index),
+            "operator_name": str(name),
+            "spatial": _json_value(spatial),
+            "temporal": _json_value(temporal),
+        })
+
+    frequency_mhz = int(hardware.npu_freq_mHz)
+    exec_cycles = int(stats.get("exec_time", -1))
+    exec_ms = (
+        exec_cycles / (frequency_mhz * 1_000.0)
+        if exec_cycles >= 0 and frequency_mhz > 0 else None
+    )
+    scale = (
+        float(total_layers) / float(simulated_layers)
+        if simulated_layers else 1.0
+    )
+    geometry = dram.geometry.as_dict()
+    row_read = {
+        "hits": int(stats.get("dram_r_row_hits", 0)),
+        "misses": int(stats.get("dram_r_row_misses", 0)),
+        "conflicts": int(stats.get("dram_r_row_conflicts", 0)),
+    }
+    row_write = {
+        "hits": int(stats.get("dram_w_row_hits", 0)),
+        "misses": int(stats.get("dram_w_row_misses", 0)),
+        "conflicts": int(stats.get("dram_w_row_conflicts", 0)),
+    }
+    record = {
+        "schema_version": EXPERIMENT_SCHEMA_VERSION,
+        "workload": {
+            "name": str(workload_name),
+            "total_layers": int(total_layers),
+            "simulated_layers": int(simulated_layers or total_layers),
+            "extrapolation_factor": scale,
+        },
+        "architecture": {
+            "num_cores": int(hardware.num_cores),
+            "core_group_size": int(hardware.core_grp_size),
+            "core_sram_bytes": int(hardware.sram_size),
+            "execution_sram_bytes": int(hardware.exe_sram_size),
+            "frequency_mhz": frequency_mhz,
+            "compute": {
+                "systolic_array_shape": _json_value(
+                    list(getattr(comp, "mm_pad_shape", []))[-2:]
+                ),
+                "vector_width": int(getattr(comp, "ew_pad_len", 0)),
+            },
+            "noc": {
+                "topology": topology,
+                "link_bandwidth_bytes_per_cycle": float(
+                    getattr(noc, "bandwidth_bytepc", 0.0)
+                ),
+            },
+            "dram": {
+                **geometry,
+                "capacity_bytes": getattr(dram, "capacity_bytes", None),
+                "timing_cycles": {
+                    "tCL": int(dram.CL),
+                    "tRCD": int(dram.tRCD),
+                    "tRP": int(dram.tRP),
+                },
+                "aggregate_bandwidth_gib_per_s": float(hardware.dram_bw_GBps),
+                "channel_bandwidth_gib_per_s": float(
+                    hardware.dram_bw_GBps / max(1, dram.num_channels)
+                ),
+                "aggregate_bytes_per_cycle_per_core": float(
+                    dram.total_bytes_per_cycle
+                ),
+                "channel_bytes_per_cycle_per_core": float(
+                    dram.channel_bytes_per_cycle
+                ),
+                "modeled_aggregate_bytes_per_cycle": float(
+                    dram.total_bytes_per_cycle * hardware.num_cores
+                ),
+                "modeled_channel_bytes_per_cycle": float(
+                    dram.channel_bytes_per_cycle * hardware.num_cores
+                ),
+                "scheduler": {
+                    "name": "bounded_fr_fcfs",
+                    "request_window": 32,
+                    "models_tRAS": False,
+                },
+                "placement_policy": str(placement_policy),
+            },
+        },
+        "tiling": tilings,
+        "metrics": {
+            "valid": exec_cycles >= 0,
+            "end_to_end_cycles": exec_cycles,
+            "end_to_end_time_ms": exec_ms,
+            "dram_bytes": {
+                "read": int(stats.get("dram_r_bytes", 0)),
+                "write": int(stats.get("dram_w_bytes", 0)),
+            },
+            "row_buffer": {
+                "read": row_read,
+                "write": row_write,
+                "total": {
+                    key: row_read[key] + row_write[key]
+                    for key in ("hits", "misses", "conflicts")
+                },
+            },
+            "dram_dynamic_energy_pj": {
+                "scope": "dynamic_no_refresh_no_static",
+                "act_pre_energy_per_conflict_pj": 7270.0,
+                "base_transfer": float(stats.get("dram_base_energy", 0.0)),
+                "row_conflict_act_pre": float(
+                    stats.get("dram_row_conflict_energy", 0.0)
+                ),
+                "total": float(stats.get("dram_energy", 0.0)),
+            },
+            "noc_byte_hops": {
+                "broadcast": float(stats.get("noc_bcast_byte_hops", 0.0)),
+                "shift": float(stats.get("noc_shift_byte_hops", 0.0)),
+                "reduce": float(stats.get("noc_reduce_byte_hops", 0.0)),
+                "total": float(stats.get("noc_byte_hops", 0.0)),
+            },
+            "total_dynamic_energy_pj": float(stats.get("exec_energy", 0.0)),
+        },
+        "cache": {"tiling": _json_value(tiling_cache or {})},
+        "operators": [
+            _operator_record(log, tilings[index] if index < len(tilings) else None)
+            for index, log in enumerate(operator_logs)
+        ],
+    }
+    identity_payload = {
+        "workload": record["workload"],
+        "architecture": record["architecture"],
+        "tiling": record["tiling"],
+    }
+    record["configuration_id"] = hashlib.blake2b(
+        json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode(),
+        digest_size=12,
+    ).hexdigest()
+    return record
+
+
+def write_experiment_records_jsonl(
+    path: str | os.PathLike[str],
+    records: Iterable[Mapping[str, Any]],
+) -> Path:
+    """Atomically write one JSON object per design point."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f"{destination.name}.tmp-{os.getpid()}"
+    )
+    with temporary.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(
+                _json_value(record), sort_keys=True, separators=(",", ":")
+            ))
+            handle.write("\n")
+    os.replace(temporary, destination)
+    return destination
+
+
+def write_experiment_record_files(
+    directory: str | os.PathLike[str],
+    records: Iterable[Mapping[str, Any]],
+) -> list[Path]:
+    """Write collision-free per-configuration JSON files for sweep reuse."""
+    output_dir = Path(directory)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for record in records:
+        configuration_id = str(record.get("configuration_id", ""))
+        if not configuration_id:
+            raise ValueError("experiment record is missing configuration_id")
+        destination = output_dir / f"{configuration_id}.json"
+        temporary = destination.with_name(
+            f"{destination.name}.tmp-{os.getpid()}"
+        )
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(_json_value(record), handle, sort_keys=True, indent=2)
+            handle.write("\n")
+        os.replace(temporary, destination)
+        paths.append(destination)
+    return paths

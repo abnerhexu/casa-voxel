@@ -108,6 +108,11 @@ class DRAMRowConflictEnergyTest(unittest.TestCase):
             energy, (1, 1, 0, 0), (0, 0), 128, 1500,
             spatial_meta={
                 "dram_row_conflicts": {"read": 1, "write": 1, "total": 2},
+                "dram_row_buffer": {
+                    "read": {"row_hits": 3, "row_misses": 2},
+                    "write": {"row_hits": 1, "row_misses": 1},
+                    "placement_policy": "channel_aware",
+                },
                 "dram_energy_breakdown_pj": {
                     "base_transfer": 2_100,
                     "row_conflict": 14_540,
@@ -118,6 +123,9 @@ class DRAMRowConflictEnergyTest(unittest.TestCase):
         self.assertEqual(op.dram_row_conflicts, 2)
         self.assertEqual(op.energy_dram_base, 2_100)
         self.assertEqual(op.energy_dram_row_conflict, 14_540)
+        self.assertEqual(op.dram_r_row_hits, 3)
+        self.assertEqual(op.dram_w_row_misses, 1)
+        self.assertEqual(op.dram_placement_policy, "channel_aware")
         self.assertGreater(op.dram_row_conflict_dynamic_power_W, 0)
 
     def test_summary_and_operator_parsers_expose_conflict_metrics(self):
@@ -128,6 +136,7 @@ class DRAMRowConflictEnergyTest(unittest.TestCase):
             "Dynamic Energy: SA = 0 mJ",
             "Dynamic Energy: DRAM = 0.3 mJ, TSV = 0 mJ",
             "DRAM row conflicts (ACT+PRE): Total=30, Read=20, Write=10, EnergyPerConflict=7.27 nJ",
+            "DRAM row buffer: TotalHits=11, TotalMisses=7, ReadHits=8, ReadMisses=5, WriteHits=3, WriteMisses=2, Placement=channel_aware",
             "DRAM dynamic energy breakdown: Base=0.0819 mJ, RowConflict=0.2181 mJ, Total=0.3 mJ",
             "DRAM dynamic power (workload average): Base=0.819 W, RowConflict=2.181 W, Total=3 W",
             "Power (w): 1, Static: 0 W (dram: 0 logic: 0), Dyn.: 1 W",
@@ -137,6 +146,9 @@ class DRAMRowConflictEnergyTest(unittest.TestCase):
         self.assertEqual(summary["dram_row_conflicts"], 30.0)
         self.assertEqual(summary["dram_r_row_conflicts"], 20.0)
         self.assertEqual(summary["dram_w_row_conflicts"], 10.0)
+        self.assertEqual(summary["dram_row_hits"], 11.0)
+        self.assertEqual(summary["dram_r_row_misses"], 5.0)
+        self.assertEqual(summary["dram_placement_policy"], "channel_aware")
         self.assertEqual(summary["dynamic_dram_base_mj"], 0.0819)
         self.assertEqual(summary["dynamic_dram_row_conflict_mj"], 0.2181)
         self.assertEqual(summary["dynamic_power_dram_row_conflict_w"], 2.181)
@@ -152,11 +164,15 @@ class DRAMRowConflictEnergyTest(unittest.TestCase):
             "NoC traffic x hops (byte-hop): Total=1, Broadcast=1, Shift=0, Reduce=0",
             "DRAM row conflicts (ACT+PRE): Total=3, Read=2, Write=1, Energy=21810 pJ",
             "DRAM dynamic power (W): Total=3, Base=0.819, RowConflict=2.181",
+            "DRAM row buffer: ReadHits=4, ReadMisses=2, WriteHits=1, WriteMisses=1, Placement=channel_aware",
             "Average Power (W): 2.5",
         ]))
         self.assertEqual(operators[0]["dram_row_conflicts"], 3.0)
         self.assertEqual(operators[0]["energy_dram_row_conflict_pj"], 21_810.0)
         self.assertEqual(operators[0]["dram_row_conflict_dynamic_power_w"], 2.181)
+        self.assertEqual(operators[0]["dram_r_row_hits"], 4.0)
+        self.assertEqual(operators[0]["dram_w_row_misses"], 1.0)
+        self.assertEqual(operators[0]["dram_placement_policy"], "channel_aware")
         self.assertEqual(operators[0]["avg_power_w"], 2.5)
 
 

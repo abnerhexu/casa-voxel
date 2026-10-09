@@ -299,6 +299,7 @@ class DRAM:
                  ultra_cache_size: int = 8192,
                  lock_cores_per_bank: float = 0,
                  soft_cores_per_bank: bool = True,
+                 capacity_bytes: Optional[int] = None,
                 ) -> None:
         self.CL: int = CL
         self.tRCD: int = tRCD
@@ -355,6 +356,9 @@ class DRAM:
         # Compatibility attribute used by callers that inspect the old name.
         self.num_banks_per_channel: int = int(geometry.banks_per_channel)
         self.transaction_bytes: int = int(geometry.transaction_bytes)
+        self.capacity_bytes: Optional[int] = (
+            int(capacity_bytes) if capacity_bytes is not None else None
+        )
         self.use_sram: bool = use_sram
         # Switch: when non-zero, lock cores_per_bank to this fixed value
         # (e.g. 2 = pin to the default 256-core / 128-bank ratio) instead of

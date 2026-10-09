@@ -121,6 +121,26 @@ def parse_summary_text(content: str) -> Dict:
             if value is not None:
                 summary[key] = value
 
+    dram_row_buffer_line = next(
+        (line for line in lines[:24] if line.startswith("DRAM row buffer")),
+        "",
+    )
+    if dram_row_buffer_line:
+        for key, pat in (
+            ("dram_row_hits", r"TotalHits=([\d.eE+-]+)"),
+            ("dram_row_misses", r"TotalMisses=([\d.eE+-]+)"),
+            ("dram_r_row_hits", r"ReadHits=([\d.eE+-]+)"),
+            ("dram_r_row_misses", r"ReadMisses=([\d.eE+-]+)"),
+            ("dram_w_row_hits", r"WriteHits=([\d.eE+-]+)"),
+            ("dram_w_row_misses", r"WriteMisses=([\d.eE+-]+)"),
+        ):
+            value = _f(pat, dram_row_buffer_line)
+            if value is not None:
+                summary[key] = value
+        placement = re.search(r"Placement=([^\s,]+)", dram_row_buffer_line)
+        if placement:
+            summary["dram_placement_policy"] = placement.group(1)
+
     dram_energy_line = next(
         (line for line in lines[:20]
          if line.startswith("DRAM dynamic energy breakdown")),
@@ -195,6 +215,12 @@ _DRAM_DYNAMIC_POWER_RE = re.compile(
     r"Total=([\d.eE+-]+),\s*Base=([\d.eE+-]+),\s*"
     r"RowConflict=([\d.eE+-]+)"
 )
+_DRAM_ROW_BUFFER_RE = re.compile(
+    r"DRAM row buffer:\s*"
+    r"ReadHits=([\d.eE+-]+),\s*ReadMisses=([\d.eE+-]+),\s*"
+    r"WriteHits=([\d.eE+-]+),\s*WriteMisses=([\d.eE+-]+),\s*"
+    r"Placement=([^\s,]+)"
+)
 _POWER_RE = re.compile(r"Average Power \(W\):\s*([\d.eE+-]+)")
 
 
@@ -234,6 +260,12 @@ def parse_operators_text(content: str) -> List[Dict]:
              if _DRAM_DYNAMIC_POWER_RE.search(candidate)),
             None,
         )
+        dram_row_buffer_m = next(
+            (_DRAM_ROW_BUFFER_RE.search(candidate)
+             for candidate in trailing_lines
+             if _DRAM_ROW_BUFFER_RE.search(candidate)),
+            None,
+        )
         if not (start_m and dur_m and util_m and bytes_m):
             continue
         operators.append({
@@ -266,6 +298,11 @@ def parse_operators_text(content: str) -> List[Dict]:
             "dram_dynamic_power_w": float(dram_dynamic_power_m.group(1)) if dram_dynamic_power_m else 0.0,
             "dram_base_dynamic_power_w": float(dram_dynamic_power_m.group(2)) if dram_dynamic_power_m else 0.0,
             "dram_row_conflict_dynamic_power_w": float(dram_dynamic_power_m.group(3)) if dram_dynamic_power_m else 0.0,
+            "dram_r_row_hits": float(dram_row_buffer_m.group(1)) if dram_row_buffer_m else 0.0,
+            "dram_r_row_misses": float(dram_row_buffer_m.group(2)) if dram_row_buffer_m else 0.0,
+            "dram_w_row_hits": float(dram_row_buffer_m.group(3)) if dram_row_buffer_m else 0.0,
+            "dram_w_row_misses": float(dram_row_buffer_m.group(4)) if dram_row_buffer_m else 0.0,
+            "dram_placement_policy": dram_row_buffer_m.group(5) if dram_row_buffer_m else "unknown",
             "avg_power_w": float(power_m.group(1)) if power_m else 0.0,
         })
     return operators

@@ -21,6 +21,7 @@ Key capabilities:
 """
 
 import pickle
+import json
 import os
 import sys
 import time
@@ -35,6 +36,11 @@ from tsim_components.mem import get_sram_area_from_size, get_dram_area_from_size
 from tsim_components.comp_util import Compute_OP, Compute
 from tsim_components.noc import Topo, NoC
 from tsim_components.tsim_analysis_lib import OverlapInterval, FusedOperatorExecLog, draw_overlap, draw_dram_intensity
+from tsim_components.experiment_output import (
+    build_experiment_record,
+    write_experiment_record_files,
+    write_experiment_records_jsonl,
+)
 
 # When True, parse_results only fully processes the best-performing configuration.
 SKIP_NON_BEST = True
@@ -555,6 +561,12 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
     stats.setdefault("dram_row_conflicts", 0)
     stats.setdefault("dram_r_row_conflicts", 0)
     stats.setdefault("dram_w_row_conflicts", 0)
+    stats.setdefault("dram_row_hits", 0)
+    stats.setdefault("dram_r_row_hits", 0)
+    stats.setdefault("dram_w_row_hits", 0)
+    stats.setdefault("dram_row_misses", 0)
+    stats.setdefault("dram_r_row_misses", 0)
+    stats.setdefault("dram_w_row_misses", 0)
     per_comp_sum =  (stats["sa_energy"] + stats["vu_energy"] + stats["noc_energy"] + stats["dram_energy"] + stats["sram_energy"] + stats["tsv_energy"])
     assert math.isclose(stats["exec_energy"], per_comp_sum, rel_tol=1e-5), \
         f"Energy breakdown does not sum to total energy! total: {stats['exec_energy']} vs {per_comp_sum}"
@@ -616,10 +628,38 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         stats["dram_row_conflicts"] = int(stats["dram_row_conflicts"] * tot_layers / sim_layers)
         stats["dram_r_row_conflicts"] = int(stats["dram_r_row_conflicts"] * tot_layers / sim_layers)
         stats["dram_w_row_conflicts"] = int(stats["dram_w_row_conflicts"] * tot_layers / sim_layers)
+        stats["dram_row_hits"] = int(stats["dram_row_hits"] * tot_layers / sim_layers)
+        stats["dram_r_row_hits"] = int(stats["dram_r_row_hits"] * tot_layers / sim_layers)
+        stats["dram_w_row_hits"] = int(stats["dram_w_row_hits"] * tot_layers / sim_layers)
+        stats["dram_row_misses"] = int(stats["dram_row_misses"] * tot_layers / sim_layers)
+        stats["dram_r_row_misses"] = int(stats["dram_r_row_misses"] * tot_layers / sim_layers)
+        stats["dram_w_row_misses"] = int(stats["dram_w_row_misses"] * tot_layers / sim_layers)
         stats["tsv_energy"] = int(stats["tsv_energy"] * tot_layers / sim_layers)
 
         stats["sa_flops"] = int(stats["sa_flops"] * tot_layers / sim_layers)  # Per core
         stats["vu_flops"] = int(stats["vu_flops"] * tot_layers / sim_layers) # Per core
+    placement_policy = (
+        "uniform" if getattr(prog, "uniform_dram_mapping", False)
+        else getattr(prog, "dram_placement_policy", "software_aware")
+    )
+    tiling_cache_info = (
+        prog.tiling_cache_info() if hasattr(prog, "tiling_cache_info") else {}
+    )
+    stats["experiment"] = build_experiment_record(
+        workload_name=getattr(prog, "name", prog.__class__.__name__),
+        hardware=hw_cfg,
+        stats=stats,
+        operator_logs=fused_op_logs,
+        partitions=all_partitions,
+        operator_names=[
+            getattr(op, "name", f"op_{index}")
+            for index, op in enumerate(unfused_ops)
+        ],
+        placement_policy=placement_policy,
+        total_layers=tot_layers,
+        simulated_layers=sim_layers,
+        tiling_cache=tiling_cache_info,
+    )
     return hw_cfg, stats, fused_op_logs, overlap_intervals
 
 def check_exe_usage(overlap_intervals: List[OverlapInterval], exe_space_size: int):
@@ -786,7 +826,8 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
                   ipu_tsim=False,
                   dataflow=False,
                   noc_traffic_hops: List[Tuple[float, float, float]] = None,
-                  dram_conflict_stats: List[Tuple[int, int, float, float]] = None):
+                  dram_conflict_stats: List[Tuple[int, int, float, float]] = None,
+                  experiment_records: List[dict] = None):
     """Post-process simulation results: select best configuration, log stats, and generate plots.
 
     For each hardware configuration in the input lists this function:
@@ -831,6 +872,9 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
         dram_conflict_stats: Optional per-configuration tuples of
             ``(read_conflicts, write_conflicts, base_energy_pJ,
             row_conflict_energy_pJ)``.
+        experiment_records: Optional versioned machine-readable records. All
+            design points are written to ``experiment_results.jsonl`` before
+            best-configuration filtering.
     """
     import matplotlib.pyplot as plt
 
@@ -843,6 +887,19 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
     if dram_conflict_stats is not None:
         assert len(dram_conflict_stats) == len(exec_times), \
             "Each run should have one DRAM row-conflict tuple"
+    if experiment_records is not None:
+        assert len(experiment_records) == len(exec_times), \
+            "Each run should have one machine-readable experiment record"
+        experiment_path = write_experiment_records_jsonl(
+            os.path.join(out_dir, "experiment_results.jsonl"),
+            experiment_records,
+        )
+        record_paths = write_experiment_record_files(
+            os.path.join(out_dir, "experiment_records"),
+            experiment_records,
+        )
+        print(f"Wrote experiment records to {experiment_path}")
+        print(f"Wrote {len(record_paths)} per-configuration experiment records")
     best_exec = -1
     best_exec_idx = -1
     #Find best config:
@@ -885,12 +942,20 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
             best_str = "ipu_tsim"
         elif dataflow:
             best_str = "dataflow"
+        elif (
+            experiment_records is not None
+            and experiment_records[i]["architecture"]["dram"]["placement_policy"]
+            != "software_aware"
+        ):
+            placement_name = experiment_records[i]["architecture"]["dram"]["placement_policy"]
+            best_str = f"placement_{placement_name}"
         else:
             best_str = "best"
         best_path = os.path.join(out_path, best_str)
         best_f = os.path.join(best_path, f"output_{cg_str}.log")
         best_overlap_f = os.path.join(best_path, f"overlap_{cg_str}.log")
         top_power_f = os.path.join(best_path, f"top_power_{cg_str}.log")
+        best_experiment_f = os.path.join(best_path, "experiment_result.json")
         os.makedirs(out_path, exist_ok=True)
         os.makedirs(best_path, exist_ok=True)
         GRAPH_RESULTS = True
@@ -985,6 +1050,19 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
                 f"RowConflict={dram_conflict_energy_pJ / 1e12 / exec_time_sec} W, "
                 f"Total={dram_energy_pJ / 1e12 / exec_time_sec} W\n"
             )
+        if experiment_records is not None:
+            row_buffer = experiment_records[i]["metrics"]["row_buffer"]
+            placement = experiment_records[i]["architecture"]["dram"]["placement_policy"]
+            log_str += (
+                "DRAM row buffer: "
+                f"TotalHits={row_buffer['total']['hits']}, "
+                f"TotalMisses={row_buffer['total']['misses']}, "
+                f"ReadHits={row_buffer['read']['hits']}, "
+                f"ReadMisses={row_buffer['read']['misses']}, "
+                f"WriteHits={row_buffer['write']['hits']}, "
+                f"WriteMisses={row_buffer['write']['misses']}, "
+                f"Placement={placement}\n"
+            )
         log_str += f"Power (w): {dyn_power_W + static_power_W}, Static: {static_power_W} W (dram: {dram_static_power_W} logic: {logic_static_power_W}), Dyn.: {dyn_power_W} W\n"
         log_str += f"Overall Util: {overall_util}\n"
         log_str += f"DRAM UTIL (%): {dram_util[0] * 100}/{dram_util[1] * 100} (R/W), SA_UTIL:{sa_util}, VU_UTIL:{vu_util}, NOC: {noc_util}\n"
@@ -1001,6 +1079,13 @@ def parse_results(hw_cfg_info: List[HardwareConfig], exec_times: List[int],
         for l_idx, log in enumerate(fused_op_log):
             log_str += log.print_stats()
         if(i == best_exec_idx): # Save a copy of the best performing config's log + graph to best path for easy access.
+            if experiment_records is not None:
+                with open(best_experiment_f, "w", encoding="utf-8") as result_file:
+                    json.dump(
+                        experiment_records[i], result_file,
+                        sort_keys=True, indent=2,
+                    )
+                    result_file.write("\n")
             with open(best_f, "w") as bf:
                 print("Writing best log to", best_f)
                 bf.write(log_str)

@@ -275,6 +275,20 @@ geometry, and placement seed. `DNNProgram.save_tiling_cache()` and
 `placement_cache_info()` and `clear_placement_cache()` inspect or clear only
 placement state. Program pickles created before this split remain readable.
 
+Every `run_tsim()` result now includes a versioned `stats["experiment"]`
+record. `parse_results()` writes every design point—not only the selected
+best point—to `experiment_results.jsonl`, and writes the best point as a
+formatted `experiment_result.json` beside its legacy text log. Records contain
+the workload/layer scale, deterministic configuration ID, compute/NoC/DRAM
+architecture, complete selected spatial/temporal tiling, placement policy and
+bank/channel summaries, end-to-end cycles and milliseconds, DRAM bytes, row
+hits/misses/conflicts, DRAM dynamic-energy breakdown, NoC byte-hops, and
+per-operator metrics. DRAM energy is explicitly labelled as dynamic energy
+excluding refresh and static power. Optional hardware JSON fields
+`capacity_bytes`, `capacity_GB`, or `capacity_MB` populate DRAM capacity in the
+record. Collision-free `experiment_records/<configuration_id>.json` files are
+also accumulated so separate sweep invocations cannot overwrite one another.
+
 ### 3.4 Generate Figures (Figs 10–20)
 
 Once simulation data is ready (verify with the dry-run in Section 3.3), each

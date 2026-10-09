@@ -2133,6 +2133,12 @@ class DNNProgram:
             "dram_row_conflicts": 0,
             "dram_r_row_conflicts": 0,
             "dram_w_row_conflicts": 0,
+            "dram_row_hits": 0,
+            "dram_r_row_hits": 0,
+            "dram_w_row_hits": 0,
+            "dram_row_misses": 0,
+            "dram_r_row_misses": 0,
+            "dram_w_row_misses": 0,
             "tsv_energy": 0,
             "dram_r_util": 0.0,   # NOTE: initially bytes, converted to util later
             "dram_w_util": 0.0,
@@ -2240,6 +2246,18 @@ class DNNProgram:
                 stats["dram_row_conflicts"] += op_exec_breakdown.dram_row_conflicts
                 stats["dram_r_row_conflicts"] += op_exec_breakdown.dram_r_row_conflicts
                 stats["dram_w_row_conflicts"] += op_exec_breakdown.dram_w_row_conflicts
+                stats["dram_r_row_hits"] += op_exec_breakdown.dram_r_row_hits
+                stats["dram_w_row_hits"] += op_exec_breakdown.dram_w_row_hits
+                stats["dram_row_hits"] += (
+                    op_exec_breakdown.dram_r_row_hits
+                    + op_exec_breakdown.dram_w_row_hits
+                )
+                stats["dram_r_row_misses"] += op_exec_breakdown.dram_r_row_misses
+                stats["dram_w_row_misses"] += op_exec_breakdown.dram_w_row_misses
+                stats["dram_row_misses"] += (
+                    op_exec_breakdown.dram_r_row_misses
+                    + op_exec_breakdown.dram_w_row_misses
+                )
                 stats["tsv_energy"] += op_exec_breakdown.energy_tsv
                 stats["dram_r_util"] += op_exec_breakdown.dram_r_bytes
                 stats["dram_w_util"] += op_exec_breakdown.dram_w_bytes
