@@ -312,6 +312,10 @@ class DRAMExecutionSession:
         trace: bool = False,
         frozen: dict | None = None,
         observer=None,
+        policy: str = "current",
+        row_budget: int | None = None,
+        max_bypass: int = 32,
+        fixed_bank_order: bool = False,
     ) -> None:
         self.dram = dram
         self.placement_policy = str(placement_policy).lower().replace("-", "_")
@@ -323,6 +327,16 @@ class DRAMExecutionSession:
         self.trace_enabled = trace
         self.frozen = frozen
         self.observer = observer
+        if policy not in ("current", "fcfs", "age_protected"):
+            raise ValueError(f"unknown scheduling policy: {policy}")
+        if row_budget is not None and row_budget < 1:
+            raise ValueError("row_budget must be positive or None")
+        if max_bypass < 1:
+            raise ValueError("max_bypass must be positive")
+        self.policy = policy
+        self.row_budget = row_budget
+        self.max_bypass = max_bypass
+        self.fixed_bank_order = fixed_bank_order
         self.snapshot = {"version": 1, "operations": {}}
         self._open_rows = [-1] * int(dram.geometry.total_banks)
         self._placement_plan = None
@@ -517,11 +531,17 @@ class DRAMExecutionSession:
             self._prepared_records,
             geometry.total_banks,
             geometry.num_channels,
-            self.placement_policy,
+            "software_aware" if self.placement_policy.startswith("stage_aware") else self.placement_policy,
             seed=self.seed,
             stripe_bytes=geometry.transaction_bytes,
             noc=self.noc,
         )
+        if self.placement_policy.startswith("stage_aware"):
+            from tsim_components.dram_stage_placement import stage_aware_plan
+            self._placement_plan = stage_aware_plan(
+                access_records, self._placement_plan, geometry, self.noc,
+                use_load=self.placement_policy != "stage_aware_no_load",
+                use_distance=self.placement_policy != "stage_aware_no_distance")
         self.snapshot["allocations"] = [{
             "record": record, "address": self._tensor_addresses[record_signature(record)],
             "bank_ids": list(self._placement_plan[record_signature(record)].bank_ids),
@@ -546,13 +566,21 @@ class DRAMExecutionSession:
             )))
             return stats
 
+        # Lazy row-budget slicing keeps memory O(input runs), not O(rows).
         pending = list(runs)
+        input_indices = list(range(len(runs)))
+        bypasses = [0] * len(runs)
+        decisions = 0
         bank_free = [0] * int(self.dram.geometry.total_banks)
         channel_free = [0] * int(self.dram.geometry.num_channels)
         record_start: Dict[int, int] = {}
         record_finish: Dict[int, int] = {}
         record_counts: Dict[int, List[int]] = {}
         events = []
+        channel_busy = [0] * len(channel_free)
+        channel_bytes = [0] * len(channel_free)
+        bank_bytes = [0] * len(bank_free)
+        bank_busy_integral = 0
 
         while pending:
             # Bounded FR-FCFS approximation.  First choose the request that
@@ -562,7 +590,7 @@ class DRAMExecutionSession:
             # the scheduler O(window) instead of expanding transaction-level
             # traces.
             def candidate_key(candidate: int) -> Tuple[int, int, int]:
-                candidate_run = pending[candidate]
+                candidate_run = self._service_chunk(pending[candidate])[0]
                 candidate_open = self._open_rows[candidate_run.bank_id]
                 candidate_hit = candidate_open == candidate_run.row_start
                 candidate_miss = candidate_open < 0
@@ -582,11 +610,35 @@ class DRAMExecutionSession:
                 )
                 return ready, 0 if candidate_hit else 1, candidate
 
-            choice = min(
-                range(min(self.frfcfs_window, len(pending))),
-                key=candidate_key,
-            )
-            run = pending.pop(choice)
+            eligible = list(range(min(self.frfcfs_window, len(pending))))
+            if self.fixed_bank_order:
+                seen = set()
+                heads = []
+                for index in eligible:
+                    if pending[index].bank_id not in seen:
+                        heads.append(index)
+                    seen.add(pending[index].bank_id)
+                eligible = heads
+            protected = [i for i in eligible if bypasses[i] >= self.max_bypass]
+            reason = "earliest_ready_hit_tiebreak"
+            if self.policy == "fcfs":
+                choice, reason = eligible[0], "fcfs"
+            elif self.policy == "age_protected" and protected:
+                choice, reason = protected[0], "age_protection"
+            else:
+                choice = min(eligible, key=candidate_key)
+            input_index = input_indices[choice]
+            run, remainder = self._service_chunk(pending[choice])
+            bypass_count = bypasses[choice]
+            for index in eligible:
+                bypasses[index] += 1
+            if remainder is None:
+                pending.pop(choice)
+                input_indices.pop(choice)
+                bypasses.pop(choice)
+            else:
+                pending[choice] = remainder
+                bypasses[choice] = 0
             open_row = self._open_rows[run.bank_id]
             first_hit = open_row == run.row_start
             first_miss = open_row < 0
@@ -608,11 +660,19 @@ class DRAMExecutionSession:
             transfer_start = max(row_ready, channel_free[run.channel_id])
             finish = transfer_start + transfer_cycles
             if self.instrument:
-                events.append({**asdict(run), "input_index": runs.index(run),
+                channel_busy[run.channel_id] += transfer_cycles
+                channel_bytes[run.channel_id] += run.num_bytes
+                bank_bytes[run.bank_id] += run.num_bytes
+                bank_busy_integral += finish - bank_free[run.bank_id]
+            if self.trace_enabled:
+                events.append({**asdict(run), "input_index": input_index,
+                               "selection_reason": reason, "bypass_count": bypass_count,
+                               "decision_index": decisions,
                                "release": 0, "bank_start": bank_free[run.bank_id],
                                "row_ready": row_ready, "transfer_start": transfer_start,
                                "finish": finish, "hits": hits, "misses": misses,
                                "conflicts": conflicts})
+            decisions += 1
             bank_free[run.bank_id] = finish
             channel_free[run.channel_id] = finish
             self._open_rows[run.bank_id] = run.row_start + run.row_count - 1
@@ -634,24 +694,17 @@ class DRAMExecutionSession:
         stats.cycles = max(channel_free, default=0)
         if self.instrument:
             channels = len(channel_free)
-            busy = [0] * channels
-            channel_bytes = [0] * channels
-            bank_bytes = [0] * len(bank_free)
-            for event in events:
-                c = event["channel_id"]
-                busy[c] += event["finish"] - event["transfer_start"]
-                channel_bytes[c] += event["num_bytes"]
-                bank_bytes[event["bank_id"]] += event["num_bytes"]
             # Idle causes cannot be inferred from bus gaps alone. Keep them
             # explicitly unclassified, rather than inventing timing stalls.
             tail = sum(stats.cycles - end for end in channel_free)
             stats.resource = {
                 "channel_bytes": channel_bytes, "bank_bytes": bank_bytes,
-                "channel_busy_cycles": busy, "channel_finish": channel_free,
+                "channel_busy_cycles": channel_busy, "channel_finish": channel_free,
                 "channel_time": channels * stats.cycles,
-                "transfer": sum(busy), "tail_idle": tail,
-                "unclassified_idle": channels * stats.cycles - sum(busy) - tail,
-                "bank_busy_integral": sum(e["finish"] - e["bank_start"] for e in events),
+                "transfer": sum(channel_busy), "tail_idle": tail,
+                "unclassified_idle": channels * stats.cycles - sum(channel_busy) - tail,
+                "bank_busy_integral": bank_busy_integral,
+                "service_events": decisions,
             }
             if self.trace_enabled:
                 stats.trace = events
@@ -664,6 +717,21 @@ class DRAMExecutionSession:
                 record_finish[record_index] - record_start[record_index]
             )
         return stats
+
+    def _service_chunk(self, run):
+        if self.row_budget is None or run.row_count <= self.row_budget:
+            return run, None
+        budget = self.row_budget
+        quotient, remainder = divmod(run.num_bytes, run.row_count)
+        size = quotient * budget + min(budget, remainder)
+        if size <= 0:
+            raise ValueError("row budget would produce zero-byte service")
+        prefix = DRAMRowRun(run.record_index, run.bank_id, run.channel_id,
+                            run.row_start, budget, size)
+        suffix = DRAMRowRun(run.record_index, run.bank_id, run.channel_id,
+                            run.row_start + budget, run.row_count - budget,
+                            run.num_bytes - size)
+        return prefix, suffix
 
     def schedule_records(
         self,

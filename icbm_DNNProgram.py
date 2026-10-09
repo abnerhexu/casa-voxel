@@ -2021,6 +2021,8 @@ class DNNProgram:
             if used_by_next:
                 dram_w_traffic += last_op_wr_traffic
                 dram_access_records.extend(last_op_write_records)
+            for record in dram_access_records:
+                record["execution_stage_id"] = f"{idx}:{record.get('stage', '')}"
             prepared_dram_ops.append((
                 int(dram_r_traffic),
                 int(dram_w_traffic),

@@ -40,3 +40,38 @@ class FrozenReplayTest(unittest.TestCase):
         dram.capacity_bytes = 100
         with self.assertRaisesRegex(ValueError, "capacity"):
             self.session(dram, frozen=session.snapshot).schedule_records(records, 0)
+
+    def test_split_conservation_and_fixed_order_counts(self):
+        records = [record("read", 1, 1025), record("read", 2, 2048), record("read", 1, 1025)]
+        counts = []
+        for budget in (None, 1, 4, 16):
+            for speed in (8, 64):
+                session = self.session(make_dram(banks=2, bytepc=speed), trace=True,
+                                       row_budget=budget, fixed_bank_order=True)
+                result = session.schedule_records(records, 0)
+                self.assertEqual(result.read.num_bytes, sum(r["total_bytes"] for r in records))
+                self.assertEqual(sum(e["num_bytes"] for e in result.read.trace), result.read.num_bytes)
+                counts.append((result.read.row_hits, result.read.row_misses, result.read.row_conflicts))
+        self.assertEqual(len(set(counts)), 1)
+
+    def test_fcfs_and_age_protection(self):
+        from tsim_components.dram_scheduler import DRAMRowRun
+        runs = [DRAMRowRun(0, 0, 0, 0, 100, 12800)] + [
+            DRAMRowRun(i, 1, 0, i, 1, 128) for i in range(1, 10)]
+        fcfs = self.session(make_dram(banks=2), trace=True, policy="fcfs")
+        out = fcfs._schedule_stage(runs, [{} for _ in runs])
+        self.assertEqual([e["input_index"] for e in out.trace], list(range(10)))
+        aged = self.session(make_dram(banks=2), trace=True, policy="age_protected", max_bypass=2)
+        out = aged._schedule_stage(runs, [{} for _ in runs])
+        self.assertEqual(out.trace[2]["input_index"], 0)
+        self.assertEqual(out.trace[2]["selection_reason"], "age_protection")
+
+    def test_stage_aware_requires_metadata_and_preserves_bytes(self):
+        dram = make_dram(banks=4, channels=2)
+        dram.execution_options = {"instrument": True}
+        records = [record("read", 1, 1024), record("write", 2, 1024)]
+        for r in records:
+            r["execution_stage_id"] = r["stage"]
+        session = dram.new_execution_session(placement_policy="stage_aware_no_distance")
+        out = session.schedule_records(records, 0)
+        self.assertEqual(out.read.num_bytes + out.write.num_bytes, 2048)
