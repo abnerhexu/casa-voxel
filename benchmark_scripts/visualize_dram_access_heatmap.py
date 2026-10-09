@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dram-num-channels", type=int, default=1)
     parser.add_argument("--stripe-bytes", type=int, default=256)
     parser.add_argument("--bank-mapping",
-                        choices=("address_trace", "hbm_interleave", "uniform", "interleave_size", "software_aware", "channel_aware"),
+                        choices=("address_trace", "hbm_interleave", "uniform", "interleave_size", "software_aware", "channel_aware", "noc_aware"),
                         default="address_trace")
     parser.add_argument("--die-size-mm", type=float, default=12.0)
     return parser.parse_args()

@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
                         choices=("address_trace", "hbm_interleave", "hbm-interleave",
                                  "fine_interleave", "fine-interleave", "bank_interleave", "bank-interleave",
                                  "from_impl", "uniform", "interleave_size", "software_aware",
-                                 "channel_aware", "channel-aware"),
+                                 "channel_aware", "channel-aware", "noc_aware", "noc-aware"),
                         default="address_trace")
     parser.add_argument("--noc-power-backend", choices=("tsim_simple", "simple", "dsent", "orion"), default="tsim_simple")
     parser.add_argument("--noc-power-flit-bits", type=int, default=64)

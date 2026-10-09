@@ -1,6 +1,7 @@
 import unittest
 
 from tsim_components.mem import DRAM
+from tsim_components.noc import NoC, Topo
 
 
 def make_dram(*, banks=1, channels=1, row_bytes=256, bytepc=32):
@@ -120,6 +121,26 @@ class DRAMExecutionSessionTest(unittest.TestCase):
 
         self.assertLessEqual(len(runs), dram.geometry.total_banks)
         self.assertEqual(sum(run.num_bytes for run in runs), 16 * 1024**3)
+
+    def test_noc_aware_session_records_selected_channels(self):
+        noc = NoC(16, Topo.MESH, list(range(8)))
+        dram = make_dram(banks=4, channels=2)
+        session = dram.new_execution_session(
+            placement_policy="noc_aware",
+            replication_factor=1,
+            noc=noc,
+        )
+        left = record("read", 0, 128)
+        left["requester_core_weights"] = [[0, 128]]
+        right = record("read", 1, 128)
+        right["requester_core_weights"] = [[7, 128]]
+        session.prepare_records([left, right])
+        result = session.schedule_records([right], op_index=0)
+
+        self.assertEqual(result.records[0]["placement_policy"], "noc_aware")
+        self.assertEqual(result.records[0]["channel_ids"], [1])
+        self.assertEqual(set(result.records[0]["bank_ids"]), {1, 3})
+        self.assertEqual(result.records[0]["channel_noc_nodes"], [5])
 
 
 if __name__ == "__main__":

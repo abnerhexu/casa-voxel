@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
                         choices=("address_trace", "hbm_interleave", "hbm-interleave",
                                  "fine_interleave", "fine-interleave", "bank_interleave", "bank-interleave",
                                  "from_impl", "uniform", "interleave_size", "software_aware",
-                                 "channel_aware", "channel-aware"),
+                                 "channel_aware", "channel-aware", "noc_aware", "noc-aware"),
                         default="address_trace",
                         help="DRAM bank placement policy used for bank-level thermal attribution.")
     parser.add_argument("--dram-bank-mappings", default="",
@@ -211,7 +211,7 @@ def validate_args(args: argparse.Namespace) -> List[str]:
         "address_trace", "hbm_interleave", "hbm-interleave",
         "fine_interleave", "fine-interleave", "bank_interleave", "bank-interleave",
         "from_impl", "uniform", "interleave_size", "software_aware",
-        "channel_aware", "channel-aware",
+        "channel_aware", "channel-aware", "noc_aware", "noc-aware",
     }
     if args.dram_bank_mappings:
         invalid = sorted(

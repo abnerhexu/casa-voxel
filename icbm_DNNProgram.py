@@ -1526,8 +1526,23 @@ class DNNProgram:
             )
             return int(TE.shape_to_size(shape) * op.expr.num_byte_per_elem)
 
+        def requester_weights(spatial_replicas, tensor_index, total_bytes):
+            requester_count = max(1, min(
+                int(self.tot_num_cores),
+                int(spatial_replicas[tensor_index]),
+            ))
+            quotient, remainder = divmod(int(total_bytes), requester_count)
+            return [
+                [core, quotient + (1 if core < remainder else 0)]
+                for core in range(requester_count)
+                if quotient + (1 if core < remainder else 0) > 0
+            ]
+
         for (idx, op) in enumerate(fused_op):
             (temporal, spatial) = next(partition_it)
+            spatial_replicas = op.expr.get_spatial_var_replicas(
+                temporal, spatial
+            )
             # Single call returns cycles, bytes, and access granularity,
             # avoiding duplicate precise/ultra-precise DRAM simulations.
             (access_list_cycles, access_list_bytes, access_list_granularity,
@@ -1571,6 +1586,11 @@ class DNNProgram:
                         ),
                         "bytes_per_core": int(load_bytes),
                         "total_bytes": int(load_bytes * self.tot_num_cores),
+                        "requester_core_weights": requester_weights(
+                            spatial_replicas,
+                            tensor_index,
+                            int(load_bytes * self.tot_num_cores),
+                        ),
                         "access_granularity_bytes": int(granularity),
                         "row_conflicts_per_core": int(row_conflicts),
                         "total_row_conflicts": int(row_conflicts * self.tot_num_cores),
@@ -1595,6 +1615,11 @@ class DNNProgram:
                     "allocation_bytes": tensor_allocation_bytes(op, 0),
                     "bytes_per_core": int(access_list_bytes[0]),
                     "total_bytes": int(access_list_bytes[0] * self.tot_num_cores),
+                    "requester_core_weights": requester_weights(
+                        spatial_replicas,
+                        0,
+                        int(access_list_bytes[0] * self.tot_num_cores),
+                    ),
                     "access_granularity_bytes": int(access_list_granularity[0]),
                     "row_conflicts_per_core": int(access_list_row_conflicts[0]),
                     "total_row_conflicts": int(access_list_row_conflicts[0] * self.tot_num_cores),
@@ -1620,6 +1645,11 @@ class DNNProgram:
                     "allocation_bytes": tensor_allocation_bytes(op, 0),
                     "bytes_per_core": int(access_list_bytes[0]),
                     "total_bytes": int(access_list_bytes[0] * self.tot_num_cores),
+                    "requester_core_weights": requester_weights(
+                        spatial_replicas,
+                        0,
+                        int(access_list_bytes[0] * self.tot_num_cores),
+                    ),
                     "access_granularity_bytes": int(access_list_granularity[0]),
                     "row_conflicts_per_core": int(access_list_row_conflicts[0]),
                     "total_row_conflicts": int(access_list_row_conflicts[0] * self.tot_num_cores),
@@ -1951,6 +1981,7 @@ class DNNProgram:
         dram_session = dram.new_execution_session(
             placement_policy=placement_policy,
             replication_factor=self.tot_num_cores,
+            noc=noc,
         )
         # Resolve every final DRAM access before scheduling any fused op. This
         # gives placement policies a motif-global view of unique tensors and

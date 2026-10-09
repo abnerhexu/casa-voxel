@@ -507,6 +507,7 @@ class DRAM:
         placement_policy: str = "software_aware",
         replication_factor: int = 1,
         frfcfs_window: Optional[int] = None,
+        noc=None,
     ):
         """Create a stateful placement-aware timing/conflict session.
 
@@ -522,6 +523,7 @@ class DRAM:
                 int(frfcfs_window) if frfcfs_window is not None
                 else int(getattr(self, "frfcfs_window", 32))
             ),
+            noc=noc,
         )
 
     def _populate_from_dram_cache(self) -> None:

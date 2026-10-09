@@ -2,13 +2,16 @@ import unittest
 
 from tsim_components.dram_placement import (
     SUPPORTED_DRAM_PLACEMENTS,
+    balanced_channel_core_groups,
     build_placement_plan,
     channel_aware_placements,
+    channel_injection_nodes,
     clear_placement_cache,
     placement_cache_info,
     record_signature,
     software_aware_placements,
 )
+from tsim_components.noc import NoC, Topo
 from tsim_thermal.trace import TraceConfig, resolve_dram_bank_mapping
 
 
@@ -38,6 +41,23 @@ def make_records():
     ]
 
 
+def make_mesh(num_cores=8):
+    return NoC(
+        bandwidth_bytepc=16,
+        topology=Topo.MESH,
+        nodes=list(range(num_cores)),
+    )
+
+
+def with_requesters(records, core=0):
+    enriched = []
+    for record in records:
+        item = dict(record)
+        item["requester_core_weights"] = [[core, item["total_bytes"]]]
+        enriched.append(item)
+    return enriched
+
+
 class DRAMPlacementTest(unittest.TestCase):
     def test_channel_aware_is_an_independent_supported_policy(self):
         self.assertIn("software_aware", SUPPORTED_DRAM_PLACEMENTS)
@@ -48,6 +68,95 @@ class DRAMPlacementTest(unittest.TestCase):
             ),
             "channel_aware",
         )
+
+    def test_noc_aware_is_an_independent_supported_policy(self):
+        self.assertIn("noc_aware", SUPPORTED_DRAM_PLACEMENTS)
+        self.assertEqual(
+            resolve_dram_bank_mapping(
+                TraceConfig(dram_bank_mapping="noc-aware")
+            ),
+            "noc_aware",
+        )
+
+    def test_channels_evenly_partition_dimension_ordered_cores(self):
+        self.assertEqual(
+            balanced_channel_core_groups(3, 8),
+            ((0, 1, 2), (3, 4, 5), (6, 7)),
+        )
+        self.assertEqual(channel_injection_nodes(3, 8), (1, 4, 6))
+
+    def test_more_channels_than_cores_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "cannot bind 9 DRAM channels"):
+            balanced_channel_core_groups(9, 8)
+        with self.assertRaisesRegex(ValueError, "cannot bind 9 DRAM channels"):
+            build_placement_plan(
+                with_requesters(make_records()),
+                total_banks=16,
+                num_channels=9,
+                policy="noc_aware",
+                noc=make_mesh(8),
+            )
+
+    def test_noc_aware_prefers_nearby_channel_injection_nodes(self):
+        records = [
+            {
+                "tensor_id": "left",
+                "stage": "read",
+                "total_bytes": 100,
+                "requester_core_weights": [[0, 100]],
+            },
+            {
+                "tensor_id": "right",
+                "stage": "read",
+                "total_bytes": 100,
+                "requester_core_weights": [[7, 100]],
+            },
+        ]
+        plan = build_placement_plan(
+            records,
+            total_banks=2,
+            num_channels=2,
+            policy="noc_aware",
+            noc=make_mesh(8),
+        )
+
+        self.assertEqual(plan[record_signature(records[0])].channel_ids, (0,))
+        self.assertEqual(plan[record_signature(records[1])].channel_ids, (1,))
+
+    def test_noc_aware_preserves_software_aware_bank_spans(self):
+        records = with_requesters(make_records())
+        software = software_aware_placements(records, total_banks=16)
+        noc_aware = build_placement_plan(
+            records,
+            total_banks=16,
+            num_channels=4,
+            policy="noc_aware",
+            noc=make_mesh(8),
+        )
+        self.assertEqual(
+            {
+                signature: len(placement.bank_ids)
+                for signature, placement in software.items()
+            },
+            {
+                signature: len(placement.bank_ids)
+                for signature, placement in noc_aware.items()
+            },
+        )
+
+    def test_noc_aware_cache_includes_requester_traffic(self):
+        left = with_requesters(make_records(), core=0)
+        right = with_requesters(make_records(), core=7)
+        clear_placement_cache()
+        left_plan = build_placement_plan(
+            left, 3, 2, "noc_aware", noc=make_mesh(8)
+        )
+        right_plan = build_placement_plan(
+            right, 3, 2, "noc_aware", noc=make_mesh(8)
+        )
+
+        self.assertNotEqual(left_plan, right_plan)
+        self.assertEqual(placement_cache_info().misses, 2)
 
     def test_channel_aware_plan_is_deterministic_and_conserves_bytes(self):
         records = make_records()
@@ -121,9 +230,13 @@ class DRAMPlacementTest(unittest.TestCase):
         records = make_records()
         for policy in SUPPORTED_DRAM_PLACEMENTS:
             with self.subTest(policy=policy):
+                policy_records = (
+                    with_requesters(records) if policy == "noc_aware" else records
+                )
                 plan = build_placement_plan(
-                    records, total_banks=16, num_channels=4,
+                    policy_records, total_banks=16, num_channels=4,
                     policy=policy, seed=11, stripe_bytes=128,
+                    noc=make_mesh(8) if policy == "noc_aware" else None,
                 )
                 self.assertEqual(len(plan), len(records))
                 for placement in plan.values():

@@ -15,7 +15,9 @@ from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
 from tsim_components.dram_placement import (
     allocation_bytes,
     build_placement_plan,
+    channel_injection_nodes,
     record_bytes,
+    requester_core_weights,
     record_signature,
 )
 
@@ -73,11 +75,13 @@ class DRAMExecutionSession:
         placement_policy: str = "software_aware",
         replication_factor: int = 1,
         frfcfs_window: int = 32,
+        noc=None,
     ) -> None:
         self.dram = dram
         self.placement_policy = str(placement_policy).lower().replace("-", "_")
         self.replication_factor = max(1, int(replication_factor))
         self.frfcfs_window = max(1, int(frfcfs_window))
+        self.noc = noc
         self._open_rows = [-1] * int(dram.geometry.total_banks)
         self._placement_plan = None
         self._tensor_addresses: Dict[object, int] = {}
@@ -173,11 +177,15 @@ class DRAMExecutionSession:
         """
         geometry = self.dram.geometry
         by_signature: Dict[object, dict] = {}
+        requester_demands: Dict[object, Dict[int, float]] = {}
         for source in access_records:
             if record_bytes(source) <= 0:
                 continue
             record = dict(source)
             signature = record_signature(record)
+            demand = requester_demands.setdefault(signature, {})
+            for core, weight in requester_core_weights(record):
+                demand[core] = demand.get(core, 0.0) + weight
             size = allocation_bytes(record)
             previous = by_signature.get(signature)
             if previous is None or size > allocation_bytes(previous):
@@ -187,6 +195,12 @@ class DRAMExecutionSession:
                 by_signature[signature] = record
             elif previous.get("address") is None and record.get("address") is not None:
                 previous["address"] = int(record["address"])
+
+        for signature, record in by_signature.items():
+            record["requester_core_weights"] = [
+                [core, weight]
+                for core, weight in sorted(requester_demands[signature].items())
+            ]
 
         alignment = max(1, int(geometry.transaction_bytes))
         explicit_ranges = sorted(
@@ -231,6 +245,7 @@ class DRAMExecutionSession:
             self.placement_policy,
             seed=0,
             stripe_bytes=geometry.transaction_bytes,
+            noc=self.noc,
         )
 
     def _schedule_stage(
@@ -357,6 +372,14 @@ class DRAMExecutionSession:
                 "address": int(self._tensor_addresses[signature]),
                 "allocation_bytes": int(allocation_bytes(record)),
             })
+            if self.placement_policy == "noc_aware":
+                nodes = channel_injection_nodes(
+                    int(self.dram.geometry.num_channels),
+                    int(self.noc.num_cores),
+                )
+                record["channel_noc_nodes"] = [
+                    nodes[channel] for channel in placement.channel_ids
+                ]
 
         read_runs = [
             run for run in runs

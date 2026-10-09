@@ -262,9 +262,16 @@ least-loaded channels, selects deterministic bank stripes inside each channel,
 and maintains separate read/write cursors. A channel-count sweep therefore
 recomputes placement while retaining the selected spatial/temporal tiling.
 Use `--dram_placement` to select `address_trace`, `hbm_interleave`, `uniform`,
-`interleave_size`, `software_aware`, or `channel_aware`; the selected physical
-banks are retained in tensor access records so thermal mapping can consume the
-same execution placement.
+`interleave_size`, `software_aware`, `channel_aware`, or `noc_aware`; the
+selected physical banks are retained in tensor access records so thermal
+mapping can consume the same execution placement. `noc_aware` keeps the
+size-proportional bank spans of `software_aware`, then chooses concrete banks
+using requester-traffic-weighted mesh hops and channel load. For X channels
+and Y dimension-ordered mesh cores, it partitions the core IDs into X balanced
+contiguous groups (sizes differ by at most one) and binds each channel to the
+lower middle core of its group. X must not exceed Y. Because this policy needs
+the final tensor-to-core mapping and exact NoC paths, standalone thermal tools
+consume its recorded execution placement rather than reconstructing it.
 
 Tiling selection and DRAM placement use separate caches. The tiling key
 contains the operator/workload shape, execution SRAM limit, core-group size,

@@ -1211,6 +1211,8 @@ def resolve_dram_bank_mapping(cfg: TraceConfig, artifact: RunArtifacts | None = 
         "program-aware": "software_aware",
         "channel-aware": "channel_aware",
         "channel": "channel_aware",
+        "noc-aware": "noc_aware",
+        "noc": "noc_aware",
         "uniform_dram": "uniform",
         "uniform_placement": "uniform",
         "interleave": "interleave_size",
@@ -1464,6 +1466,11 @@ def dram_mapping_record_events(
     if mapping == "address_trace" and not has_execution_placement:
         return dram_address_trace_record_events(
             meta, kind, cfg, artifact, op, op_position, package_count
+        )
+    if mapping == "noc_aware" and not has_execution_placement:
+        raise ValueError(
+            "noc_aware thermal attribution requires bank_ids recorded by a "
+            "NoC-aware VOXEL execution"
         )
 
     stripe_bytes = max(1, int(cfg.hbm_interleave_stripe_bytes))
