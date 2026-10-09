@@ -263,6 +263,15 @@ def gen_pickle(args:argparse.Namespace, output_dir, layer, order_pickle_filename
     prog = get_model_from_file(f"models/TExpr/TExpr_{args.modelname}-b{args.batch_size}.json", name=f"{args.modelname}-b{args.batch_size}",
                             output_dir=f"{output_dir}/{args.num_cores}cores",
                             num_cores=[args.num_cores], tot_mem_size_per_core=args.core_mem_kb*1024)
+    if args.motif_layers:
+        prog.select_layer_motif(
+            total_layers=args.layers,
+            motif_start_layer=args.motif_start_layer,
+            motif_layers=args.motif_layers,
+        )
+        prog.name = (
+            f"{prog.name}-motif{args.motif_start_layer}+{args.motif_layers}"
+        )
     prog.update_te_hw(comp, noc, args.spmd_compiler, args.seq_noc, args.ipu_tsim)
     prog.uniform_dram_mapping = args.uniform_dram_mapping
     prog.dram_placement_policy = args.dram_placement
@@ -329,6 +338,14 @@ if __name__ == "__main__":
     parser.add_argument("--prefill", "--training", dest="prefill", action='store_true', required=False, default=False)
     parser.add_argument("--dram_bw", required=False, type=int, default=10000)
     parser.add_argument("--sim_layers", required=False, type=int, default=0)
+    parser.add_argument(
+        "--motif_layers", required=False, type=int, default=0,
+        help="Compile and simulate only this many contiguous layers.",
+    )
+    parser.add_argument(
+        "--motif_start_layer", required=False, type=int, default=0,
+        help="Zero-based first layer of the compiled motif.",
+    )
     parser.add_argument("--trace_out_dir_base", required=False, type=str, default="results/logs")
     # Precise (request-level) DRAM mode — see DRAM._precise_num_cycle_of_access
     # in tsim_components/mem.py. Default off; existing analytical fast path
@@ -348,6 +365,12 @@ if __name__ == "__main__":
     parser.add_argument("--soft_cores_per_bank", action='store_true', required=False, default=True,
                         help="Soft mode: cores_per_bank unchanged when <2, else halved (e.g. 2->1, 4->2, 8->4).")
     args = parser.parse_args()
+
+    if args.motif_layers:
+        if args.sim_layers:
+            parser.error("--motif_layers cannot be combined with --sim_layers")
+        if args.layers % args.motif_layers:
+            parser.error("--layers must be divisible by --motif_layers")
 
     # Dataflow mode disables soft cores-per-bank: dataflow splits cores
     # across pipeline stages so the bank-contention heuristic (which
@@ -421,18 +444,22 @@ if __name__ == "__main__":
         output_dir = args.output_dir
     else:
         output_dir = f"results/pickles/outputs_icbm_{args.sequence_length}"
-    layer = args.layers
+    layer = args.motif_layers or args.layers
 
     mem_threshold = TE.MAX_MEM_THRESHOLD
 
-    pickle_filename = f"{output_dir}/{args.num_cores}cores/{args.modelname}-b{args.batch_size}/program.pickle"
-    order_pickle_filename = f"{output_dir}/{args.num_cores}cores/{args.modelname}-b{args.batch_size}/order.pickle"
+    motif_tag = (
+        f"-motif{args.motif_start_layer}+{args.motif_layers}"
+        if args.motif_layers else ""
+    )
+    pickle_filename = f"{output_dir}/{args.num_cores}cores/{args.modelname}-b{args.batch_size}/program{motif_tag}.pickle"
+    order_pickle_filename = f"{output_dir}/{args.num_cores}cores/{args.modelname}-b{args.batch_size}/order{motif_tag}.pickle"
 
     # ------------------------------------------------------------------ #
     #  Load cached program or compile from scratch                         #
     # ------------------------------------------------------------------ #
     if not args.use_pickle or \
-       not os.path.exists(f"{output_dir}/{args.num_cores}cores/{args.modelname}-b{args.batch_size}/program.pickle") or \
+       not os.path.exists(pickle_filename) or \
        not os.path.exists(order_pickle_filename):
         prog = gen_pickle(args, output_dir, layer, order_pickle_filename, pickle_filename, comp, noc)
 
@@ -509,11 +536,13 @@ if __name__ == "__main__":
             print(f"exe_space {exe_space} < prog.max_hot_size {prog.max_hot_size}, skipping")
             continue
 
+        modeled_layers = args.motif_layers or args.layers
+        aggregate_scale = args.layers / modeled_layers
         params.append((total_sram_byte_per_core, exe_space,
                        args.core_group, args.dram_bw, 
                        hw_config["dram"]["npu_freq_MHz"],
-                       args.layers, args.sim_layers, args.dram_name, 
-                       args.spmd_compiler, args.seq_noc))
+                       modeled_layers, args.sim_layers, args.dram_name,
+                       args.spmd_compiler, args.seq_noc, aggregate_scale))
 
     # Cap the number of configurations to evaluate.  For baseline/IPU modes
     # only a single configuration (min or max exe_space) is meaningful.
@@ -591,7 +620,18 @@ if __name__ == "__main__":
     # parse_results picks the best-performing exe_space partition and writes
     # timing / energy breakdowns to the output directory.
     mode = "prefill" if args.prefill else "decode"
-    out_dir = os.path.join(args.trace_out_dir_base, str(args.modelname), str(f"bs_{args.batch_size}"), str(f"core_{args.num_cores}"), mode)
+    motif_output = (
+        f"motif_{args.motif_start_layer}_{args.motif_layers}"
+        if args.motif_layers else "full_model"
+    )
+    out_dir = os.path.join(
+        args.trace_out_dir_base,
+        str(args.modelname),
+        str(f"bs_{args.batch_size}"),
+        str(f"core_{args.num_cores}"),
+        mode,
+        motif_output,
+    )
     parse_results(  hw_cfgs, exec_time_list, exec_energy_list, exec_comp_list, 
                     exec_sss_list, exec_sa_list, exec_vu_list, exec_noc_list,
                     exec_sram_list, exec_dram_list, exec_tsv_list,

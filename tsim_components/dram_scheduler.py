@@ -13,10 +13,10 @@ from math import ceil
 from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 from tsim_components.dram_placement import (
+    allocation_bytes,
     build_placement_plan,
     record_bytes,
     record_signature,
-    stable_u64,
 )
 
 
@@ -79,6 +79,9 @@ class DRAMExecutionSession:
         self.replication_factor = max(1, int(replication_factor))
         self.frfcfs_window = max(1, int(frfcfs_window))
         self._open_rows = [-1] * int(dram.geometry.total_banks)
+        self._placement_plan = None
+        self._tensor_addresses: Dict[object, int] = {}
+        self._prepared_records: List[dict] = []
 
     @property
     def _chip_channel_bytes_per_cycle(self) -> float:
@@ -93,14 +96,19 @@ class DRAMExecutionSession:
         op_index: int,
     ) -> Tuple[List[DRAMRowRun], Dict[object, object]]:
         geometry = self.dram.geometry
-        plan = build_placement_plan(
-            records,
-            geometry.total_banks,
-            geometry.num_channels,
-            self.placement_policy,
-            seed=int(op_index),
-            stripe_bytes=geometry.transaction_bytes,
-        )
+        if self._placement_plan is None:
+            self.prepare_records(records)
+        plan = self._placement_plan
+        missing = {
+            record_signature(record) for record in records
+            if record_bytes(record) > 0
+            and record_signature(record) not in plan
+        }
+        if missing:
+            raise ValueError(
+                "DRAM execution session saw tensors absent from its global "
+                f"placement plan: {sorted(missing)}"
+            )
         runs: List[DRAMRowRun] = []
         for record_index, record in enumerate(records):
             size = record_bytes(record)
@@ -127,6 +135,10 @@ class DRAMExecutionSession:
             )]
             byte_quotient, byte_remainder = divmod(size, len(active_banks))
             row_quotient, row_remainder = divmod(total_row_touches, len(active_banks))
+            signature = record_signature(record)
+            base_address = self._tensor_addresses[signature]
+            base_row = base_address // geometry.bytes_per_row
+            max_rows_per_bank = int(ceil(total_row_touches / len(active_banks)))
             for bank_ordinal, bank_id in enumerate(active_banks):
                 bank_bytes = byte_quotient + (1 if bank_ordinal < byte_remainder else 0)
                 if bank_bytes <= 0:
@@ -135,9 +147,7 @@ class DRAMExecutionSession:
                 # Tensor regions are stable within an op and deliberately
                 # distinct between tensors.  Consecutive rows are represented
                 # by one run, keeping scheduling cost O(records * banks).
-                row_start = stable_u64(
-                    "dram-row", op_index, *record_signature(record), bank_id
-                ) % (1 << 40)
+                row_start = base_row + bank_ordinal * max_rows_per_bank
                 channel_id, _bank, _layer, _bank_in_layer = \
                     geometry.decode_bank(bank_id)
                 runs.append(DRAMRowRun(
@@ -149,6 +159,79 @@ class DRAMExecutionSession:
                     num_bytes=int(bank_bytes),
                 ))
         return runs, plan
+
+    def prepare_records(
+        self,
+        access_records: Sequence[Mapping[str, object]],
+    ) -> None:
+        """Allocate motif-global tensor addresses and build one placement.
+
+        The allocation is deterministic and transaction-aligned. Explicit
+        addresses supplied by an imported trace are preserved; tensors
+        without one receive a non-overlapping logical base address. The same
+        plan is then shared by every fused operator in this execution session.
+        """
+        geometry = self.dram.geometry
+        by_signature: Dict[object, dict] = {}
+        for source in access_records:
+            if record_bytes(source) <= 0:
+                continue
+            record = dict(source)
+            signature = record_signature(record)
+            size = allocation_bytes(record)
+            previous = by_signature.get(signature)
+            if previous is None or size > allocation_bytes(previous):
+                if previous is not None and previous.get("address") is not None:
+                    record.setdefault("address", previous["address"])
+                record["allocation_bytes"] = size
+                by_signature[signature] = record
+            elif previous.get("address") is None and record.get("address") is not None:
+                previous["address"] = int(record["address"])
+
+        alignment = max(1, int(geometry.transaction_bytes))
+        explicit_ranges = sorted(
+            (
+                int(record["address"]),
+                int(record["address"]) + allocation_bytes(record),
+                signature,
+            )
+            for signature, record in by_signature.items()
+            if record.get("address") is not None
+        )
+        for previous, current in zip(explicit_ranges, explicit_ranges[1:]):
+            if current[0] < previous[1]:
+                raise ValueError(
+                    "explicit tensor address ranges overlap: "
+                    f"{previous[2]} and {current[2]}"
+                )
+        cursor = max((end for _start, end, _signature in explicit_ranges), default=0)
+        for signature in sorted(by_signature):
+            record = by_signature[signature]
+            size = allocation_bytes(record)
+            address = record.get("address")
+            if address is None:
+                cursor = int(ceil(cursor / alignment) * alignment)
+                address = cursor
+            address = int(address)
+            record["address"] = address
+            self._tensor_addresses[signature] = address
+            cursor = max(cursor, address + size)
+
+        capacity = getattr(self.dram, "capacity_bytes", None)
+        if capacity is not None and cursor > int(capacity):
+            raise ValueError(
+                f"tensor allocations require {cursor} bytes, exceeding "
+                f"DRAM capacity {capacity} bytes"
+            )
+        self._prepared_records = list(by_signature.values())
+        self._placement_plan = build_placement_plan(
+            self._prepared_records,
+            geometry.total_banks,
+            geometry.num_channels,
+            self.placement_policy,
+            seed=0,
+            stripe_bytes=geometry.transaction_bytes,
+        )
 
     def _schedule_stage(
         self,
@@ -239,7 +322,8 @@ class DRAMExecutionSession:
         records = [dict(record) for record in access_records]
         runs, plan = self._row_runs(records, op_index)
         for record in records:
-            placement = plan.get(record_signature(record))
+            signature = record_signature(record)
+            placement = plan.get(signature)
             if placement is None:
                 continue
             record.update({
@@ -247,6 +331,8 @@ class DRAMExecutionSession:
                 "placement_policy": self.placement_policy,
                 "bank_ids": list(placement.bank_ids),
                 "channel_ids": list(placement.channel_ids),
+                "address": int(self._tensor_addresses[signature]),
+                "allocation_bytes": int(allocation_bytes(record)),
             })
 
         read_runs = [

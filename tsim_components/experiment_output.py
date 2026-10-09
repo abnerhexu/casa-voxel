@@ -40,6 +40,26 @@ def _operator_record(log: object, tiling: Mapping[str, Any] | None) -> dict:
         for access in accesses
         for channel in (access.get("channel_ids", []) or [])
     })
+    tensor_accesses = [
+        {
+            "tensor_id": _json_value(access.get("tensor_id")),
+            "stage": str(access.get("stage", "")),
+            "address": (
+                int(access["address"])
+                if access.get("address") is not None else None
+            ),
+            "allocation_bytes": int(access.get("allocation_bytes", 0) or 0),
+            "transfer_bytes": int(access.get("total_bytes", 0) or 0),
+            "bank_ids": [
+                int(bank) for bank in (access.get("bank_ids", []) or [])
+            ],
+            "channel_ids": [
+                int(channel)
+                for channel in (access.get("channel_ids", []) or [])
+            ],
+        }
+        for access in accesses
+    ]
     return {
         "operator_index": int(getattr(log, "op_id", 0)),
         "tiling": _json_value(tiling or {}),
@@ -87,6 +107,7 @@ def _operator_record(log: object, tiling: Mapping[str, Any] | None) -> dict:
             "bank_ids": banks,
             "channel_ids": channels,
             "access_record_count": len(accesses),
+            "tensor_accesses": tensor_accesses,
         },
     }
 
@@ -103,6 +124,9 @@ def build_experiment_record(
     total_layers: int,
     simulated_layers: int,
     tiling_cache: Mapping[str, Any] | None = None,
+    motif_start_layer: int = 0,
+    motif_layers: int = 0,
+    source_total_layers: int = 0,
 ) -> dict:
     """Build one complete L1-ready result record for a design point."""
     dram = hardware.mem
@@ -144,14 +168,22 @@ def build_experiment_record(
         "misses": int(stats.get("dram_w_row_misses", 0)),
         "conflicts": int(stats.get("dram_w_row_conflicts", 0)),
     }
+    workload = {
+        "name": str(workload_name),
+        "total_layers": int(total_layers),
+        "simulated_layers": int(simulated_layers or total_layers),
+        "extrapolation_factor": scale,
+    }
+    if motif_layers:
+        workload["motif"] = {
+            "start_layer": int(motif_start_layer),
+            "layers": int(motif_layers),
+            "source_total_layers": int(source_total_layers or total_layers),
+        }
+
     record = {
         "schema_version": EXPERIMENT_SCHEMA_VERSION,
-        "workload": {
-            "name": str(workload_name),
-            "total_layers": int(total_layers),
-            "simulated_layers": int(simulated_layers or total_layers),
-            "extrapolation_factor": scale,
-        },
+        "workload": workload,
         "architecture": {
             "num_cores": int(hardware.num_cores),
             "core_group_size": int(hardware.core_grp_size),

@@ -404,16 +404,18 @@ def run_tsim_helper(params):
     Returns:
         The return value of ``run_tsim``.
     """
-    # 10-param lightweight version (large objects from initializer)
-    if len(params) == 10:
-        total_sram_byte_per_core, exe_space, core_group_size, dram_bandwidth_GBps, npu_freq_MHz, tot_layers, sim_layers, dram_name, spmd_compiler, seq_noc = params
+    # 10/11-param lightweight version (large objects from initializer)
+    if len(params) in (10, 11):
+        total_sram_byte_per_core, exe_space, core_group_size, dram_bandwidth_GBps, npu_freq_MHz, tot_layers, sim_layers, dram_name, spmd_compiler, seq_noc = params[:10]
+        aggregate_scale = params[10] if len(params) == 11 else 1.0
         prog = _worker_shared['prog']
         dram = _worker_shared['dram']
         noc = _worker_shared['noc']
         comp_op = _worker_shared['comp_op']
     else:
         # Legacy 14-param path
-        prog, total_sram_byte_per_core, exe_space, dram, noc, comp_op, core_group_size, dram_bandwidth_GBps, npu_freq_MHz, tot_layers, sim_layers, dram_name, spmd_compiler, seq_noc = params
+        prog, total_sram_byte_per_core, exe_space, dram, noc, comp_op, core_group_size, dram_bandwidth_GBps, npu_freq_MHz, tot_layers, sim_layers, dram_name, spmd_compiler, seq_noc = params[:14]
+        aggregate_scale = params[14] if len(params) == 15 else 1.0
     return run_tsim(prog=prog,
                     total_sram_byte_per_core=total_sram_byte_per_core,
                     exe_space=exe_space,
@@ -427,11 +429,13 @@ def run_tsim_helper(params):
                     sim_layers=sim_layers,
                     dram_name=dram_name,
                     spmd_compiler=spmd_compiler,
-                    seq_noc=seq_noc)
+                    seq_noc=seq_noc,
+                    aggregate_scale=aggregate_scale)
 
 def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:DRAM, noc:NoC, comp_op:Compute_OP,
              core_group_size:int, dram_bandwidth_GBps:int, npu_freq_MHz:int, tot_layers:int, sim_layers:int,
-             dram_name:str = "unspec_mem", spmd_compiler:bool = False, seq_noc:bool = False) -> \
+             dram_name:str = "unspec_mem", spmd_compiler:bool = False, seq_noc:bool = False,
+             aggregate_scale:float = 1.0) -> \
             Tuple[HardwareConfig, int, int, List[FusedOperatorExecLog], List[OverlapInterval]]:
     """Run a full temporal simulation for one hardware configuration.
 
@@ -604,40 +608,35 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
     stats["dram_r_util"] = stats["dram_r_bytes"]/(stats["exec_time"] / (1e6 * npu_freq_MHz) * dram_bandwidth_GBps * 2 ** 30)
     stats["dram_w_util"] = stats["dram_w_bytes"]/(stats["exec_time"] / (1e6 * npu_freq_MHz) * dram_bandwidth_GBps * 2 ** 30)
 
-    # If only a subset of layers was simulated, linearly extrapolate all
-    # aggregate metrics to the full model depth.
-    if sim_layers:
-        stats["dram_r_bytes"] = int(stats["dram_r_bytes"] * tot_layers / sim_layers) # Extrapolate to total layers
-        stats["dram_w_bytes"] = int(stats["dram_w_bytes"] * tot_layers / sim_layers) # Extrapolate to total layers
-        stats["exec_time"] = int(stats["exec_time"] * tot_layers / sim_layers) #Extrapolate results to all-layer exec time.
-        stats["comp_energy"] = int(stats["comp_energy"] * tot_layers / sim_layers)
-        stats["sss_energy"] = int(stats["sss_energy"] * tot_layers / sim_layers)
-
-        stats["exec_energy"] = int(stats["exec_energy"] * tot_layers / sim_layers)
-        stats["sa_energy"] = int(stats["sa_energy"] * tot_layers / sim_layers)
-        stats["vu_energy"] = int(stats["vu_energy"] * tot_layers / sim_layers)
-        stats["sram_energy"] = int(stats["sram_energy"] * tot_layers / sim_layers)
-        stats["noc_energy"] = int(stats["noc_energy"] * tot_layers / sim_layers)
-        stats["noc_bcast_byte_hops"] *= tot_layers / sim_layers
-        stats["noc_shift_byte_hops"] *= tot_layers / sim_layers
-        stats["noc_reduce_byte_hops"] *= tot_layers / sim_layers
-        stats["noc_byte_hops"] *= tot_layers / sim_layers
-        stats["dram_energy"] = int(stats["dram_energy"] * tot_layers / sim_layers)
-        stats["dram_base_energy"] = int(stats["dram_base_energy"] * tot_layers / sim_layers)
-        stats["dram_row_conflict_energy"] = int(stats["dram_row_conflict_energy"] * tot_layers / sim_layers)
-        stats["dram_row_conflicts"] = int(stats["dram_row_conflicts"] * tot_layers / sim_layers)
-        stats["dram_r_row_conflicts"] = int(stats["dram_r_row_conflicts"] * tot_layers / sim_layers)
-        stats["dram_w_row_conflicts"] = int(stats["dram_w_row_conflicts"] * tot_layers / sim_layers)
-        stats["dram_row_hits"] = int(stats["dram_row_hits"] * tot_layers / sim_layers)
-        stats["dram_r_row_hits"] = int(stats["dram_r_row_hits"] * tot_layers / sim_layers)
-        stats["dram_w_row_hits"] = int(stats["dram_w_row_hits"] * tot_layers / sim_layers)
-        stats["dram_row_misses"] = int(stats["dram_row_misses"] * tot_layers / sim_layers)
-        stats["dram_r_row_misses"] = int(stats["dram_r_row_misses"] * tot_layers / sim_layers)
-        stats["dram_w_row_misses"] = int(stats["dram_w_row_misses"] * tot_layers / sim_layers)
-        stats["tsv_energy"] = int(stats["tsv_energy"] * tot_layers / sim_layers)
-
-        stats["sa_flops"] = int(stats["sa_flops"] * tot_layers / sim_layers)  # Per core
-        stats["vu_flops"] = int(stats["vu_flops"] * tot_layers / sim_layers) # Per core
+    # Legacy subset simulation and explicit motif scaling share the same
+    # aggregate-only scaling path.  A motif is already the complete simulated
+    # program, so it must use sim_layers=0 and an explicit aggregate_scale.
+    aggregate_scale = float(aggregate_scale)
+    if aggregate_scale <= 0:
+        raise ValueError("aggregate_scale must be positive")
+    if sim_layers and not math.isclose(aggregate_scale, 1.0):
+        raise ValueError(
+            "sim_layers prefix scaling and aggregate_scale cannot be combined"
+        )
+    scale_factor = (float(tot_layers) / sim_layers) if sim_layers else aggregate_scale
+    if not math.isclose(scale_factor, 1.0):
+        integer_metrics = (
+            "dram_r_bytes", "dram_w_bytes", "exec_time", "comp_energy",
+            "sss_energy", "exec_energy", "sa_energy", "vu_energy",
+            "sram_energy", "noc_energy", "dram_energy", "dram_base_energy",
+            "dram_row_conflict_energy", "dram_row_conflicts",
+            "dram_r_row_conflicts", "dram_w_row_conflicts", "dram_row_hits",
+            "dram_r_row_hits", "dram_w_row_hits", "dram_row_misses",
+            "dram_r_row_misses", "dram_w_row_misses", "tsv_energy",
+            "sa_flops", "vu_flops",
+        )
+        for key in integer_metrics:
+            stats[key] = int(stats[key] * scale_factor)
+        for key in (
+            "noc_bcast_byte_hops", "noc_shift_byte_hops",
+            "noc_reduce_byte_hops", "noc_byte_hops",
+        ):
+            stats[key] *= scale_factor
     placement_policy = (
         "uniform" if getattr(prog, "uniform_dram_mapping", False)
         else getattr(prog, "dram_placement_policy", "software_aware")
@@ -656,9 +655,12 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
             for index, op in enumerate(unfused_ops)
         ],
         placement_policy=placement_policy,
-        total_layers=tot_layers,
-        simulated_layers=sim_layers,
+        total_layers=int(round((sim_layers or tot_layers) * scale_factor)),
+        simulated_layers=int(sim_layers or tot_layers),
         tiling_cache=tiling_cache_info,
+        motif_start_layer=int(getattr(prog, "motif_start_layer", 0)),
+        motif_layers=int(getattr(prog, "motif_layers", 0)),
+        source_total_layers=int(getattr(prog, "source_total_layers", 0)),
     )
     return hw_cfg, stats, fused_op_logs, overlap_intervals
 

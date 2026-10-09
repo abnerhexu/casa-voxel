@@ -22,6 +22,7 @@ def make_dram(*, banks=1, channels=1, row_bytes=256, bytepc=32):
 
 def record(stage, tensor_index, size):
     return {
+        "tensor_id": tensor_index,
         "subop_index": 0,
         "tensor_index": tensor_index,
         "tensor_role": "input" if stage == "read" else "output",
@@ -58,8 +59,11 @@ class DRAMExecutionSessionTest(unittest.TestCase):
         self.assertEqual(first.read.row_misses, 1)
         self.assertEqual(first.read.row_conflicts, 0)
         self.assertEqual(second.read.row_misses, 0)
-        self.assertEqual(second.read.row_conflicts, 1)
-        self.assertEqual(second.read.cycles - first.read.cycles, 14)
+        self.assertEqual(second.read.row_hits, 1)
+        self.assertEqual(second.read.row_conflicts, 0)
+        self.assertEqual(first.records[0]["address"], second.records[0]["address"])
+        self.assertEqual(first.records[0]["bank_ids"], second.records[0]["bank_ids"])
+        self.assertEqual(first.read.cycles - second.read.cycles, 14)
 
     def test_read_and_write_share_the_same_bank_state(self):
         session = make_dram().new_execution_session(
@@ -70,8 +74,23 @@ class DRAMExecutionSessionTest(unittest.TestCase):
         )
 
         self.assertEqual(result.read.row_misses, 1)
-        self.assertEqual(result.write.row_conflicts, 1)
-        self.assertEqual(result.records[1]["total_row_conflicts"], 1)
+        self.assertEqual(result.write.row_hits, 1)
+        self.assertEqual(result.write.row_conflicts, 0)
+        self.assertEqual(result.records[1]["total_row_conflicts"], 0)
+
+    def test_global_prepare_allocates_distinct_non_overlapping_tensors(self):
+        session = make_dram(banks=4, channels=1).new_execution_session(
+            placement_policy="address_trace", replication_factor=1
+        )
+        records = [record("read", 10, 256), record("read", 11, 512)]
+        for item in records:
+            item["allocation_bytes"] = item["total_bytes"]
+        session.prepare_records(records)
+
+        first = session.schedule_records([records[0]], op_index=0).records[0]
+        second = session.schedule_records([records[1]], op_index=1).records[0]
+        self.assertNotEqual(first["address"], second["address"])
+        self.assertGreaterEqual(second["address"], first["address"] + 256)
 
     def test_tiling_granularity_changes_row_conflicts_at_equal_bytes(self):
         coarse_record = record("read", 0, 1024)

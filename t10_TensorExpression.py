@@ -10,6 +10,7 @@ import time
 import t10_predictor
 from tsim_components.comp import Compute
 from tsim_components.noc import NoC
+from tsim_components import utils as tsim_utils
 from t10_OpPartitionSearch import OpSpatialPartitionSearch, OpTemporalPartitionSearch, build_spatial_search_tree
 
 FUSED_K = 1   # Weight of energy in the fused metric
@@ -874,23 +875,13 @@ class TensorExpression:
                 return predict
 
         elif self.op_type==self.OP_TYPE_MATMUL:
-            out = self.variables[0].flatten()[-2:]
-            inA = self.variables[1].flatten()[-2:]
-            inB = self.variables[2].flatten()[-2:]
-            kset = np.intersect1d(inA, inB)
-            k_idx = np.setdiff1d(kset, out)[0]
-            m_idx = np.setdiff1d(inA[-2:], [k_idx])[0]
-            n_idx = np.setdiff1d(inB[-2:], [k_idx])[0]
-            k = sub_op_shape[k_idx]
-            m = sub_op_shape[m_idx]
-            n = sub_op_shape[n_idx]
+            b, k, m, n = tsim_utils.dim_var_to_bkmn(
+                list(sub_op_shape), self.variables
+            )
             if n>m:
                 m,n = n,m
             if m<=16:
                 m,n = n,m
-            b = 1
-            if len(sub_op_shape>3):
-                b = np.prod(sub_op_shape[:-3])
 
             m_div_6 = np.ceil(m/6)
             k_div_16 = np.ceil(k/(32/self.num_byte_per_elem))
@@ -1049,23 +1040,13 @@ class TensorExpression:
             return predict, add_mul + read + write + predict*COMP_INSTR_BYTE_PER_CYCLE*READ_PJ + predict*IDLE_PJ_PER_CORE_CYCLE, per_component_breakdown
 
         elif self.op_type==self.OP_TYPE_MATMUL:
-            out = self.variables[0].flatten()[-2:]
-            inA = self.variables[1].flatten()[-2:]
-            inB = self.variables[2].flatten()[-2:]
-            kset = np.intersect1d(inA, inB)
-            k_idx = np.setdiff1d(kset, out)[0]
-            m_idx = np.setdiff1d(inA[-2:], [k_idx])[0]
-            n_idx = np.setdiff1d(inB[-2:], [k_idx])[0]
-            k = sub_op_shape[k_idx]
-            m = sub_op_shape[m_idx]
-            n = sub_op_shape[n_idx]
+            b, k, m, n = tsim_utils.dim_var_to_bkmn(
+                list(sub_op_shape), self.variables
+            )
             if n>m:
                 m,n = n,m
             if m<=16:
                 m,n = n,m
-            b = 1
-            if len(sub_op_shape>3):
-                b = np.prod(sub_op_shape[:-3])
 
             m_div_6 = np.ceil(m/6)
             k_div_16 = np.ceil(k/(32/self.num_byte_per_elem))
@@ -2224,4 +2205,3 @@ class TensorExpression:
                 break
 
         return smallest_hot_size
-

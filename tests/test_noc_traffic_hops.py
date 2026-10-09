@@ -193,14 +193,18 @@ class NoCTrafficHopsTest(unittest.TestCase):
                 npu_freq_MHz=1500,
                 tot_layers=1,
                 sim_layers=0,
+                aggregate_scale=4,
             )
 
-        self.assertEqual(stats["noc_byte_hops"], 760.0)
-        self.assertEqual(stats["noc_bcast_byte_hops"], 300.0)
-        self.assertEqual(stats["noc_shift_byte_hops"], 360.0)
-        self.assertEqual(stats["noc_reduce_byte_hops"], 100.0)
+        self.assertEqual(stats["noc_byte_hops"], 3040.0)
+        self.assertEqual(stats["noc_bcast_byte_hops"], 1200.0)
+        self.assertEqual(stats["noc_shift_byte_hops"], 1440.0)
+        self.assertEqual(stats["noc_reduce_byte_hops"], 400.0)
         self.assertEqual(logs[0].noc_byte_hops, 760.0)
-        self.assertEqual(stats["experiment"]["metrics"]["noc_byte_hops"]["total"], 760.0)
+        self.assertEqual(stats["experiment"]["metrics"]["noc_byte_hops"]["total"], 3040.0)
+        self.assertEqual(stats["experiment"]["workload"]["total_layers"], 4)
+        self.assertEqual(stats["experiment"]["workload"]["simulated_layers"], 1)
+        self.assertEqual(stats["experiment"]["workload"]["extrapolation_factor"], 4.0)
         self.assertEqual(len(stats["experiment"]["tiling"]), 1)
 
 

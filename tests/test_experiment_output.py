@@ -83,6 +83,8 @@ class ExperimentOutputTest(unittest.TestCase):
             dram_placement_policy=placement,
             spatial_meta={
                 "dram_access_records": [{
+                    "tensor_id": 42, "stage": "read", "address": 4096,
+                    "allocation_bytes": 8192, "total_bytes": 1024,
                     "bank_ids": [0, 8], "channel_ids": [0],
                 }],
             },
@@ -116,6 +118,10 @@ class ExperimentOutputTest(unittest.TestCase):
         self.assertEqual(record["metrics"]["row_buffer"]["total"]["conflicts"], 12)
         self.assertEqual(record["metrics"]["dram_dynamic_energy_pj"]["total"], 95_640)
         self.assertEqual(record["operators"][0]["placement"]["bank_ids"], [0, 8])
+        self.assertEqual(
+            record["operators"][0]["placement"]["tensor_accesses"][0]["address"],
+            4096,
+        )
         self.assertEqual(record["tiling"][0]["spatial"], [8, 32])
 
     def test_configuration_id_changes_with_placement(self):

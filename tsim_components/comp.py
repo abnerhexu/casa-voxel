@@ -247,7 +247,7 @@ class Compute:
             A padded :class:`OP` instance.
         """
         original_dim_lengths = dim_len
-        padded_dim_lengths = original_dim_lengths
+        padded_dim_lengths = list(original_dim_lengths)
         if is_ew:
             if np.prod(original_dim_lengths) < 2*IPU_EW_PAD_LEN:
                 longest_dim = np.argmax(original_dim_lengths)
@@ -256,30 +256,18 @@ class Compute:
                 padded_longest_dim_len = ceil(1.5 * IPU_EW_PAD_LEN / remaining_dim_len)
                 padded_dim_lengths[longest_dim] = padded_longest_dim_len
         else:
-            # Identify M, K, N dimension indices from the variable mapping:
-            # K is the contraction dim (shared by both inputs but not the output).
-            # M comes from input A; N comes from input B.
-            out = variables[0].flatten()[-2:]
-            inA = variables[1].flatten()[-2:]
-            inB = variables[2].flatten()[-2:]
-            kset = np.intersect1d(inA, inB)
-            k_idx = np.setdiff1d(kset, out)[0]
-            m_idx = np.setdiff1d(inA[-2:], [k_idx])[0]
-            n_idx = np.setdiff1d(inB[-2:], [k_idx])[0]
-            m = padded_dim_lengths[m_idx]
-            n = padded_dim_lengths[n_idx]
-            # Ensure M >= N for canonical ordering (unless M <= 16).
-            if n > m:
-                m, n = n, m
-                m_idx, n_idx = n_idx, m_idx
-            if m <= 16:
-                m, n = n, m
-                m_idx, n_idx = n_idx, m_idx
-
-            # Round M, K, N up to IPU alignment boundaries.
-            padded_dim_lengths[m_idx] = ceil(padded_dim_lengths[m_idx] / IPU_MM_PAD_SHAPE[0]) * IPU_MM_PAD_SHAPE[0]
-            padded_dim_lengths[k_idx] = ceil(padded_dim_lengths[k_idx] / IPU_MM_PAD_SHAPE[1]) * IPU_MM_PAD_SHAPE[1]
-            padded_dim_lengths[n_idx] = ceil(padded_dim_lengths[n_idx] / IPU_MM_PAD_SHAPE[2]) * IPU_MM_PAD_SHAPE[2]
+            _batch, k_dims, m_dims, n_dims = utils.matmul_dimension_groups(
+                variables
+            )
+            self._pad_flattened_dimension_group(
+                padded_dim_lengths, m_dims, IPU_MM_PAD_SHAPE[0]
+            )
+            self._pad_flattened_dimension_group(
+                padded_dim_lengths, k_dims, IPU_MM_PAD_SHAPE[1]
+            )
+            self._pad_flattened_dimension_group(
+                padded_dim_lengths, n_dims, IPU_MM_PAD_SHAPE[2]
+            )
 
         op = self.OP(is_ew = is_ew,
                      variables = variables,
@@ -314,7 +302,7 @@ class Compute:
             return self.convert_op_ipu(dim_len, variables, is_ew, ignore_variables, tensor_id_list, op_type)
 
         original_dim_lengths = dim_len
-        padded_dim_lengths = original_dim_lengths
+        padded_dim_lengths = list(original_dim_lengths)
         if is_ew:
             if np.prod(original_dim_lengths) < 2*self.ew_pad_len:
                 longest_dim = np.argmax(original_dim_lengths)
@@ -323,10 +311,18 @@ class Compute:
                 padded_longest_dim_len = ceil(1.5 * self.ew_pad_len / remaining_dim_len)
                 padded_dim_lengths[longest_dim] = padded_longest_dim_len
         else:
-            # Pad the last 3 dimensions (M, K, N) to SA alignment granularity.
-            padded_dim_lengths[-1] = ceil(padded_dim_lengths[-1] / self.mm_pad_shape[-1]) * self.mm_pad_shape[-1]
-            padded_dim_lengths[-2] = ceil(padded_dim_lengths[-2] / self.mm_pad_shape[-2]) * self.mm_pad_shape[-2]
-            padded_dim_lengths[-3] = ceil(padded_dim_lengths[-3] / self.mm_pad_shape[-3]) * self.mm_pad_shape[-3]
+            _batch, k_dims, m_dims, n_dims = utils.matmul_dimension_groups(
+                variables
+            )
+            self._pad_flattened_dimension_group(
+                padded_dim_lengths, m_dims, self.mm_pad_shape[0]
+            )
+            self._pad_flattened_dimension_group(
+                padded_dim_lengths, k_dims, self.mm_pad_shape[1]
+            )
+            self._pad_flattened_dimension_group(
+                padded_dim_lengths, n_dims, self.mm_pad_shape[2]
+            )
 
         op = self.OP(is_ew = is_ew,
                      variables = variables,
@@ -336,6 +332,23 @@ class Compute:
                      op_type = op_type,
                      )
         return op
+
+    @staticmethod
+    def _pad_flattened_dimension_group(dim_lengths, indices, alignment):
+        """Pad one axis so a flattened logical dimension meets alignment."""
+        indices = tuple(indices)
+        if not indices:
+            return
+        alignment = max(1, int(alignment))
+        group_product = int(np.prod([dim_lengths[index] for index in indices]))
+        padded_product = int(ceil(group_product / alignment) * alignment)
+        if padded_product == group_product:
+            return
+        pad_index = indices[-1]
+        other_product = int(np.prod([
+            dim_lengths[index] for index in indices if index != pad_index
+        ])) if len(indices) > 1 else 1
+        dim_lengths[pad_index] = int(ceil(padded_product / other_product))
 
     def get_ew_load_store_cycles_from_padded_tile(self,
                                                   variables: List[List[List[int]]],
@@ -568,24 +581,13 @@ class Compute:
                 return predict
 
         elif op.op_type == OP_TYPE_MATMUL:
-            # Identify M, K, N indices (same logic as convert_op_ipu).
-            out = op.variables[0].flatten()[-2:]
-            inA = op.variables[1].flatten()[-2:]
-            inB = op.variables[2].flatten()[-2:]
-            kset = np.intersect1d(inA, inB)
-            k_idx = np.setdiff1d(kset, out)[0]
-            m_idx = np.setdiff1d(inA[-2:], [k_idx])[0]
-            n_idx = np.setdiff1d(inB[-2:], [k_idx])[0]
-            k = sub_op_shape[k_idx]
-            m = sub_op_shape[m_idx]
-            n = sub_op_shape[n_idx]
+            b, k, m, n = utils.dim_var_to_bkmn(
+                list(sub_op_shape), op.variables
+            )
             if n > m:
                 m, n = n, m
             if m <= 16:
                 m, n = n, m
-            b = 1
-            if len(sub_op_shape > 3):
-                b = np.prod(sub_op_shape[:-3])
 
             # IPU matmul regression model, parameterised by tile sizes
             # normalised to the hardware granularity (6, 32/byte_per_elem, 16).

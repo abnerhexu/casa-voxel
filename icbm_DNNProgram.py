@@ -481,6 +481,9 @@ class DNNProgram:
         self.ipu_no_overlap: bool = False
         self.ipu_trace_tag: str = ""
         self.op_init_overhead: int = 0
+        self.motif_start_layer: int = 0
+        self.motif_layers: int = 0
+        self.source_total_layers: int = 0
 
 
 
@@ -490,6 +493,47 @@ class DNNProgram:
         if self._ops_cache is None:
             self._ops_cache = list(itertools.chain.from_iterable(self.op_groups))
         return self._ops_cache
+
+    def select_layer_motif(
+        self,
+        total_layers: int,
+        motif_start_layer: int,
+        motif_layers: int,
+    ) -> None:
+        """Keep one contiguous, equal-width layer motif for compilation.
+
+        Tensor IDs are deliberately preserved so DRAM placement can assign
+        stable addresses to values crossing operator and layer boundaries.
+        Aggregate scaling is handled later by ``run_tsim`` and is not folded
+        into the operator list.
+        """
+        total_layers = int(total_layers)
+        motif_start_layer = int(motif_start_layer)
+        motif_layers = int(motif_layers)
+        if total_layers <= 0:
+            raise ValueError("total_layers must be positive")
+        if motif_layers <= 0:
+            raise ValueError("motif_layers must be positive")
+        if motif_start_layer < 0 or motif_start_layer + motif_layers > total_layers:
+            raise ValueError(
+                f"motif [{motif_start_layer}, "
+                f"{motif_start_layer + motif_layers}) is outside "
+                f"the {total_layers}-layer model"
+            )
+        full_ops = list(self.ops)
+        if len(full_ops) % total_layers:
+            raise ValueError(
+                f"cannot split {len(full_ops)} operators evenly across "
+                f"{total_layers} layers"
+            )
+        ops_per_layer = len(full_ops) // total_layers
+        begin = motif_start_layer * ops_per_layer
+        end = (motif_start_layer + motif_layers) * ops_per_layer
+        self.op_groups = [full_ops[begin:end]]
+        self._ops_cache = None
+        self.motif_start_layer = motif_start_layer
+        self.motif_layers = motif_layers
+        self.source_total_layers = total_layers
 
     def trim_for_simulation(self):
         """Drop compilation-phase data that run_tsim never reads.
@@ -1403,6 +1447,22 @@ class DNNProgram:
         dram_access_records = []
         last_op_write_records = []
         last_idx = len(fused_op) - 1
+
+        def tensor_id(op, tensor_index):
+            if tensor_index == 0:
+                value = getattr(op, "output_idx", None)
+            else:
+                inputs = getattr(op, "input_idx_list", None) or []
+                value = inputs[tensor_index - 1] \
+                    if tensor_index - 1 < len(inputs) else None
+            return value if value is not None else f"{op.name}:tensor:{tensor_index}"
+
+        def tensor_allocation_bytes(op, tensor_index):
+            shape = np.array(
+                op.expr.dim_lengths[op.expr.variables[tensor_index]], copy=True
+            )
+            return int(TE.shape_to_size(shape) * op.expr.num_byte_per_elem)
+
         for (idx, op) in enumerate(fused_op):
             (temporal, spatial) = next(partition_it)
             # Single call returns cycles, bytes, and access granularity,
@@ -1442,7 +1502,11 @@ class DNNProgram:
                         "subop_index": int(idx),
                         "tensor_index": int(tensor_index),
                         "tensor_role": "input",
+                        "tensor_id": tensor_id(op, tensor_index),
                         "stage": "read",
+                        "allocation_bytes": tensor_allocation_bytes(
+                            op, tensor_index
+                        ),
                         "bytes_per_core": int(load_bytes),
                         "total_bytes": int(load_bytes * self.tot_num_cores),
                         "access_granularity_bytes": int(granularity),
@@ -1464,7 +1528,9 @@ class DNNProgram:
                     "subop_index": int(idx),
                     "tensor_index": 0,
                     "tensor_role": "output",
+                    "tensor_id": tensor_id(op, 0),
                     "stage": "write",
+                    "allocation_bytes": tensor_allocation_bytes(op, 0),
                     "bytes_per_core": int(access_list_bytes[0]),
                     "total_bytes": int(access_list_bytes[0] * self.tot_num_cores),
                     "access_granularity_bytes": int(access_list_granularity[0]),
@@ -1487,7 +1553,9 @@ class DNNProgram:
                     "subop_index": int(idx),
                     "tensor_index": 0,
                     "tensor_role": "output",
+                    "tensor_id": tensor_id(op, 0),
                     "stage": "write",
+                    "allocation_bytes": tensor_allocation_bytes(op, 0),
                     "bytes_per_core": int(access_list_bytes[0]),
                     "total_bytes": int(access_list_bytes[0] * self.tot_num_cores),
                     "access_granularity_bytes": int(access_list_granularity[0]),
@@ -1774,10 +1842,9 @@ class DNNProgram:
             A 7-tuple ``(dram_op_traffic, dram_op_times, noc_op_times,
             agg_hot_cold_table, fused_op_energy, comp_unit_stats, spatial_meta)``.
         """
-        # Three independent iterators over the same partition list -- one each
-        # for NoC, DRAM, and energy evaluation passes.
+        # Independent iterators over the same partition list for NoC, DRAM,
+        # and energy evaluation passes.
         noc_part_it = iter(partitions)
-        dram_part_it = iter(partitions)
         energy_part_it = iter(partitions)
         noc_data_it = iter(noc_data)
         agg_hot_cold_table = []
@@ -1795,6 +1862,37 @@ class DNNProgram:
             placement_policy=placement_policy,
             replication_factor=self.tot_num_cores,
         )
+        # Resolve every final DRAM access before scheduling any fused op. This
+        # gives placement policies a motif-global view of unique tensors and
+        # lets one write/read pair retain the same address and physical banks.
+        dram_part_it = iter(partitions)
+        prepared_dram_ops = []
+        motif_access_records = []
+        for idx, fused_op in enumerate(fused_ops):
+            (
+                _read_cycles, _write_cycles, _last_op_wr_cycles,
+                dram_r_traffic, dram_w_traffic, last_op_wr_traffic,
+                last_op_unconditional, _dram_r_row_conflicts,
+                _dram_w_row_conflicts, _last_op_w_row_conflicts,
+                dram_access_records, last_op_write_records,
+            ) = self.get_dram_time(
+                fused_op, dram, core_group_size, dram_part_it
+            )
+            used_by_next = (
+                last_op_unconditional
+                or self.used_by_next_fused_op(idx, fused_ops)
+            )
+            if used_by_next:
+                dram_w_traffic += last_op_wr_traffic
+                dram_access_records.extend(last_op_write_records)
+            prepared_dram_ops.append((
+                int(dram_r_traffic),
+                int(dram_w_traffic),
+                dram_access_records,
+            ))
+            motif_access_records.extend(dram_access_records)
+        dram_session.prepare_records(motif_access_records)
+
         peak_sa_flopc, peak_vu_flopc = comp.get_peak_flopc()
         inv_tot_num_cores = 1.0 / self.tot_num_cores
         for (idx, fused_op) in enumerate(fused_ops):
@@ -1806,18 +1904,8 @@ class DNNProgram:
             cold_size, hot_size = self.get_aggregate_hot_cold_sizes(fused_op, exe_sram_per_core, use_largest_cold)
 
             # --- 3. DRAM cycles and byte traffic ---
-            read_cycles, write_cycles, last_op_wr_cycles, dram_r_traffic, dram_w_traffic, last_op_wr_traffic, last_op_unconditional, \
-                dram_r_row_conflicts, dram_w_row_conflicts, last_op_w_row_conflicts, \
-                dram_access_records, last_op_write_records \
-                = self.get_dram_time(fused_op, dram, core_group_size, dram_part_it)
-            # Include the last sub-op's write only if its output must go to DRAM
-            # (unconditional write, or consumed by next fused-op via ignore flag)
-            used_by_next = last_op_unconditional or self.used_by_next_fused_op(idx, fused_ops)
-            write_cycles += last_op_wr_cycles if used_by_next else 0
-            dram_w_traffic += last_op_wr_traffic if used_by_next else 0
-            dram_w_row_conflicts += last_op_w_row_conflicts if used_by_next else 0
-            if used_by_next:
-                dram_access_records.extend(last_op_write_records)
+            dram_r_traffic, dram_w_traffic, dram_access_records = \
+                prepared_dram_ops[idx]
 
             # Placement, timing, row-buffer counts, and conflict energy all
             # consume this single event stream.  The old analytical values

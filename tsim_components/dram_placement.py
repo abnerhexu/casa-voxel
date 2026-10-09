@@ -15,7 +15,7 @@ from math import ceil, floor
 from typing import Dict, Iterable, Mapping, Sequence, Tuple
 
 
-RecordSignature = Tuple[int, int, str, str]
+RecordSignature = Tuple[str, int, int, str, str]
 
 SUPPORTED_DRAM_PLACEMENTS = frozenset({
     "address_trace",
@@ -28,7 +28,14 @@ SUPPORTED_DRAM_PLACEMENTS = frozenset({
 
 
 def record_signature(record: Mapping[str, object]) -> RecordSignature:
+    tensor_id = record.get("tensor_id")
+    if tensor_id is not None:
+        # A physical tensor keeps one placement across reads, writes,
+        # operators, and layers. String conversion also supports synthetic
+        # IDs used by tests and imported traces.
+        return (str(tensor_id), 0, 0, "", "")
     return (
+        "",
         int(record.get("subop_index", 0) or 0),
         int(record.get("tensor_index", 0) or 0),
         str(record.get("tensor_role", "tensor")),
@@ -39,6 +46,13 @@ def record_signature(record: Mapping[str, object]) -> RecordSignature:
 def record_bytes(record: Mapping[str, object]) -> int:
     return max(0, int(
         record.get("total_bytes") or record.get("bytes_per_core") or 0
+    ))
+
+
+def allocation_bytes(record: Mapping[str, object]) -> int:
+    """Return physical allocation size, distinct from transfer traffic."""
+    return max(0, int(
+        record.get("allocation_bytes") or record_bytes(record)
     ))
 
 
@@ -292,8 +306,9 @@ def _cached_placement_plan(
 ) -> Tuple[Tuple[RecordSignature, TensorPlacement], ...]:
     records = []
     for signature, size, address in record_specs:
-        subop_index, tensor_index, tensor_role, stage = signature
+        tensor_id, subop_index, tensor_index, tensor_role, stage = signature
         record = {
+            "tensor_id": tensor_id or None,
             "subop_index": subop_index,
             "tensor_index": tensor_index,
             "tensor_role": tensor_role,
@@ -330,14 +345,37 @@ def build_placement_plan(
     or invalidating the independent tiling cache.
     """
     normalized_policy = str(policy).lower().replace("-", "_")
-    record_specs = tuple(sorted(
-        (
-            record_signature(record),
-            record_bytes(record),
-            int(record["address"]) if record.get("address") is not None else None,
+    # Placement operates on physical allocations, not individual accesses.
+    # Coalesce repeated reads/writes of one tensor and use its largest known
+    # allocation while retaining one stable base address.
+    allocations: Dict[RecordSignature, Tuple[int, object]] = {}
+    for record in records:
+        size = allocation_bytes(record)
+        if size <= 0:
+            continue
+        signature = record_signature(record)
+        address = (
+            int(record["address"]) if record.get("address") is not None else None
         )
-        for record in records
-        if record_bytes(record) > 0
+        previous = allocations.get(signature)
+        if previous is None:
+            allocations[signature] = (size, address)
+        else:
+            previous_size, previous_address = previous
+            if (
+                address is not None and previous_address is not None
+                and address != previous_address
+            ):
+                raise ValueError(
+                    f"tensor {signature[0]!r} has inconsistent base addresses"
+                )
+            allocations[signature] = (
+                max(previous_size, size),
+                previous_address if previous_address is not None else address,
+            )
+    record_specs = tuple(sorted(
+        (signature, size, address)
+        for signature, (size, address) in allocations.items()
     ))
     cached = _cached_placement_plan(
         record_specs,

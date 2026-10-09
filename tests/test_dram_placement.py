@@ -138,6 +138,31 @@ class DRAMPlacementTest(unittest.TestCase):
         self.assertEqual(second.hits, 1)
         self.assertEqual(final.misses, 3)
 
+    def test_global_tensor_identity_coalesces_read_and_write(self):
+        records = [
+            {
+                "tensor_id": 42, "subop_index": 0, "tensor_index": 0,
+                "tensor_role": "output", "stage": "write",
+                "total_bytes": 128, "allocation_bytes": 1024,
+                "address": 4096,
+            },
+            {
+                "tensor_id": 42, "subop_index": 3, "tensor_index": 1,
+                "tensor_role": "input", "stage": "read",
+                "total_bytes": 512, "allocation_bytes": 1024,
+                "address": 4096,
+            },
+        ]
+        plan = build_placement_plan(
+            records, total_banks=16, num_channels=4,
+            policy="address_trace", stripe_bytes=128,
+        )
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(
+            plan[record_signature(records[0])],
+            plan[record_signature(records[1])],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
