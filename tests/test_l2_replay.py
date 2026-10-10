@@ -4,6 +4,26 @@ from test_dram_execution_session import make_dram, record
 
 
 class FrozenReplayTest(unittest.TestCase):
+    def test_completion_breakdown_matches_trace_and_joint_idealization(self):
+        from tsim_components.noc import NoC, Topo
+        noc = NoC(bandwidth_bytepc=1, topology=Topo.MESH, nodes=list(range(4)))
+        records = [dict(record("read", 1, 4096), requester_core_weights=[(3, 1)])]
+        for cf in ("none", "ideal_dram", "ideal_dram_noc", "ideal_memory"):
+            for budget in (None, 1):
+                dram = make_dram(banks=4, channels=2)
+                dram.execution_options = dict(counterfactual=cf, instrument=True, trace=True, row_budget=budget)
+                session = dram.new_execution_session(placement_policy="uniform", noc=noc)
+                stats = session.schedule_records(records, 0).read
+                c = stats.resource["completion"]
+                self.assertEqual(sum(c[k] for k in ("critical_transfer", "critical_row_ready_gap", "noc_extension")), stats.cycles)
+                self.assertEqual(c["critical_transfer"] + c["critical_row_ready_gap"], stats.dram_cycles)
+                events = [e for e in stats.trace if e["channel_id"] == c["critical_channel"]]
+                self.assertEqual(sum(e["finish"]-e["transfer_start"] for e in events), c["critical_transfer"])
+                if cf == "ideal_memory":
+                    self.assertEqual(stats.cycles, 0)
+                    self.assertEqual(stats.num_bytes, 4096)
+                    self.assertGreater(stats.noc_byte_hops, 0)
+
     def session(self, dram, **options):
         dram.execution_options = options
         return dram.new_execution_session(placement_policy="uniform")

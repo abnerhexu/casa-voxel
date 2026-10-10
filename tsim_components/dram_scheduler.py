@@ -88,6 +88,34 @@ class DRAMScheduleResult:
     records: List[dict]
 
 
+def completion_breakdown(stats):
+    """A DRAM-reference completion decomposition, NOT idle-cause inference.
+
+    Each bank is attached to one channel. Its previous completion cannot be
+    later than that channel's previous completion. Thus each gap before a
+    transfer is exposed aggregate row readiness in this row-run model.
+    NoC extension is an algebraic max-model residual, not measured backpressure.
+    """
+    r = stats.resource
+    if not r or "channel_finish" not in r:
+        return
+    critical = max(range(len(r["channel_finish"])), key=lambda c: (r["channel_finish"][c], -c))
+    transfer = r["channel_busy_cycles"][critical]
+    gap = r["channel_row_ready_gap"][critical]
+    if transfer + gap != stats.dram_cycles:
+        raise AssertionError("critical-channel time does not conserve DRAM completion")
+    r["completion"] = {
+        "critical_channel": critical, "critical_transfer": transfer,
+        "critical_row_ready_gap": gap,
+        "noc_extension": max(0, stats.noc_cycles - stats.dram_cycles),
+        "memory_cycles": max(stats.dram_cycles, stats.noc_cycles),
+        "active_channels": sum(v > 0 for v in r["channel_bytes"]),
+        "channel_count": len(r["channel_bytes"]),
+        "max_mean_load": (max(r["channel_bytes"]) * len(r["channel_bytes"]) / stats.num_bytes
+                          if stats.num_bytes else 0),
+    }
+
+
 def _noc_stage_startup_cycles(noc) -> int:
     configured = getattr(noc, "dram_noc_startup_cycles", None)
     if configured is not None:
@@ -176,6 +204,7 @@ def _attach_dram_noc_stats(
     """
     stats.dram_cycles = int(stats.cycles)
     if noc is None or not runs or stats.num_bytes <= 0:
+        completion_breakdown(stats)
         return
     if not getattr(noc, "exact_topo", False):
         raise ValueError("DRAM-to-core NoC accounting requires an exact topology")
@@ -288,6 +317,7 @@ def _attach_dram_noc_stats(
     # DRAM and the mesh stream independent 128-B transactions. Their payload
     # phases therefore overlap and the slower resource determines completion.
     stats.cycles = max(int(stats.dram_cycles), int(stats.noc_cycles))
+    completion_breakdown(stats)
 
 
 class DRAMExecutionSession:
@@ -339,7 +369,7 @@ class DRAMExecutionSession:
         self.row_budget = row_budget
         self.max_bypass = max_bypass
         self.fixed_bank_order = fixed_bank_order
-        if counterfactual not in ("none", "ideal_row_switch", "ideal_dram_noc", "ideal_dram"):
+        if counterfactual not in ("none", "ideal_row_switch", "ideal_dram_noc", "ideal_dram", "ideal_memory"):
             raise ValueError("unknown counterfactual")
         self.counterfactual = counterfactual
         self.requested_counterfactual = counterfactual
@@ -610,6 +640,7 @@ class DRAMExecutionSession:
         record_counts: Dict[int, List[int]] = {}
         events = []
         channel_busy = [0] * len(channel_free)
+        channel_row_ready_gap = [0] * len(channel_free)
         channel_bytes = [0] * len(channel_free)
         bank_bytes = [0] * len(bank_free)
         bank_busy_integral = 0
@@ -638,7 +669,7 @@ class DRAMExecutionSession:
                 )
                 if self.counterfactual == "ideal_row_switch":
                     candidate_row_cycles = candidate_run.row_count * int(self.dram.CL)
-                elif self.counterfactual == "ideal_dram":
+                elif self.counterfactual in ("ideal_dram", "ideal_memory"):
                     candidate_row_cycles = 0
                 ready = max(
                     bank_free[candidate_run.bank_id] + candidate_row_cycles,
@@ -698,12 +729,15 @@ class DRAMExecutionSession:
             )
             if self.counterfactual == "ideal_row_switch":
                 row_ready = bank_free[run.bank_id] + run.row_count * int(self.dram.CL)
-            elif self.counterfactual == "ideal_dram":
+            elif self.counterfactual in ("ideal_dram", "ideal_memory"):
                 row_ready = bank_free[run.bank_id]
                 transfer_cycles = 0
             transfer_start = max(row_ready, channel_free[run.channel_id])
             finish = transfer_start + transfer_cycles
             if self.instrument:
+                if bank_free[run.bank_id] > channel_free[run.channel_id]:
+                    raise AssertionError("bank/channel predecessor order is inconsistent")
+                channel_row_ready_gap[run.channel_id] += transfer_start - channel_free[run.channel_id]
                 channel_busy[run.channel_id] += transfer_cycles
                 channel_bytes[run.channel_id] += run.num_bytes
                 bank_bytes[run.bank_id] += run.num_bytes
@@ -745,6 +779,7 @@ class DRAMExecutionSession:
             stats.resource = {
                 "channel_bytes": channel_bytes, "bank_bytes": bank_bytes,
                 "channel_busy_cycles": channel_busy, "channel_finish": channel_free,
+                "channel_row_ready_gap": channel_row_ready_gap,
                 "channel_time": channels * stats.cycles,
                 "transfer": sum(channel_busy), "tail_idle": tail,
                 "unclassified_idle": channels * stats.cycles - sum(channel_busy) - tail,
@@ -838,11 +873,12 @@ class DRAMExecutionSession:
             noc=self.noc,
             num_channels=int(self.dram.geometry.num_channels),
         )
-        if self.counterfactual == "ideal_dram_noc":
+        if self.counterfactual in ("ideal_dram_noc", "ideal_memory"):
             # Remove only time. Physical traffic/energy remain accounted for.
             for stats in (read, write):
                 stats.noc_cycles = 0
                 stats.cycles = stats.dram_cycles
+                completion_breakdown(stats)
             for record in records:
                 record["dram_noc_cycles"] = 0
         result = DRAMScheduleResult(read=read, write=write, records=records)

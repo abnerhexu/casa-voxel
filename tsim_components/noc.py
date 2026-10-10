@@ -48,7 +48,8 @@ CUSTOM_INIT_CYCLES = 50  # TODO: consider making this an input parameter
 # Default dynamic transport energy for the lightweight built-in model.  The
 # unit is deliberately per byte-hop: one byte crossing two links consumes
 # twice the transport energy of one byte crossing one link.
-NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP = 12.0
+# Explicit L2 transport-model assumption; sync/control is accounted separately.
+NOC_DYNAMIC_ENERGY_PJ_PER_BYTE_HOP = 2.0
 NOC_ROUTER_PIPELINE_CYCLES_PER_HOP = 1
 
 class Topo(Enum):
