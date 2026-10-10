@@ -2100,6 +2100,9 @@ class DNNProgram:
                 "total": int(total_dram_row_conflicts),
             }
             op_spatial_meta["dram_row_buffer"] = {
+                # Effective, operator-scoped mode; preserve traffic even when
+                # a counterfactual removes its service time.
+                "counterfactual": getattr(dram_session, "counterfactual", "none"),
                 "read": dram_schedule.read.as_dict(),
                 "write": dram_schedule.write.as_dict(),
                 "placement_policy": placement_policy,

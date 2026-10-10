@@ -419,6 +419,9 @@ class FusedOperatorExecLog:
         self.energy_tsv         = energy[3]["tsv"]
         dram_meta = (spatial_meta or {}).get("dram_row_conflicts", {})
         dram_row_buffer = (spatial_meta or {}).get("dram_row_buffer", {})
+        self.dram_time_idealized = dram_row_buffer.get("counterfactual", "none") in (
+            "ideal_dram", "ideal_memory"
+        )
         dram_read_buffer = dram_row_buffer.get("read", {})
         dram_write_buffer = dram_row_buffer.get("write", {})
         dram_energy_meta = (spatial_meta or {}).get("dram_energy_breakdown_pj", {})
@@ -576,7 +579,8 @@ class FusedOperatorExecLog:
         if self.dram_st_dur > 0:
             assert(self.t_dram_st_start + self.dram_st_dur == self.t_finish), f"Sanity check: finish time equal to end of write for writing ops."
         else:
-            assert(self.dram_w_bytes == 0), f"We should not write bytes if dram write takes no time!"
+            assert self.dram_w_bytes == 0 or self.dram_time_idealized, \
+                "We should not write bytes if dram write takes no time!"
             assert(self.t_reduce_start + self.reduce_dur == self.t_finish), \
             f"Sanity check: Finish time equal to end of reduce for non-writing ops: {self.reduce_dur + self.reduce_dur} vs {self.t_finish}"
         assert(self.mm_util >= 0 and self.mm_util <= 1.2), f"MM utilization should be a float between 0 and 1.2! {self.mm_util} flop={self.mm_flop_per_core} dur={self.mm_dur} op={str(self)}"
