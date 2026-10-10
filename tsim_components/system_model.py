@@ -163,6 +163,11 @@ def validate_graph(graph, hw):
                     raise ValueError("invalid operator flow")
         for access in j.get("accesses", []):
             tensor = tensors[access["tensor"]]
+            passes = access.get("passes", 1)
+            if (type(passes) is not int or passes < 1 or
+                    access["kind"] == "write" and passes != 1 or
+                    passes != 1 and graph.get("execution_model") != "aggregate"):
+                raise ValueError("repeated streams require the aggregate model; writes occur once")
             if (access["kind"] not in ("read", "write") or
                     type(access["core"]) is not int or access["core"] not in cores or
                     type(access.get("offset", 0)) is not int or access.get("offset", 0) < 0 or
@@ -263,6 +268,11 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
     SPMD serializes shift before compute; other modes overlap independent
     compute/shift tasks. Dataflow concurrency comes from explicit job/core DAGs.
     """
+    if graph.get("execution_model") == "aggregate":
+        from .aggregate_model import execute as aggregate_execute
+        return aggregate_execute(graph,hw,mapping,paradigm=paradigm,chunk_bytes=chunk_bytes,
+            resident=resident,counterfactual=counterfactual,fixed_bank_order=fixed_bank_order,
+            trace=trace,max_tasks=max_tasks)
     if paradigm not in ("spmd", "dataflow", "compute_shift"):
         raise ValueError("unknown paradigm")
     kinds = ("stream", "inter_tensor", "revisit", "other")

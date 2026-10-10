@@ -121,7 +121,7 @@ def lower_operator(spec, comp, cores, *, max_cells=200000, max_segments=2000000,
 
     Only previous-wave operands are retained. A shift in wave k supplies an
     input to wave k+1, so overlap with wave k compute is dependency-correct.
-    Output accumulator storage is conservatively reserved for the whole op.
+    Output accumulators are live from their first partial to their final write.
     """
     import numpy as np
     waves, wave, occupied, work, logical_cells = [], [], set(), 0, []
@@ -157,13 +157,12 @@ def lower_operator(spec, comp, cores, *, max_cells=200000, max_segments=2000000,
         raise TraceError("iteration cells do not conserve arithmetic work")
     # Deterministic owner per output tile. All partial contributors are counted
     # before placing the final write, preventing premature accumulator stores.
-    owners, remaining, output_storage = {}, Counter(), Counter()
+    owners, remaining = {}, Counter()
     for wave in waves:
         for cell in wave:
             out = cell["parts"][0]
             if out not in owners:
                 owners[out] = cell["core"]
-                output_storage[cell["core"]] += sum(n for _, n in out)
             remaining[out] += 1
     steps, demands = [], []
     for wave in waves:
@@ -172,13 +171,16 @@ def lower_operator(spec, comp, cores, *, max_cells=200000, max_segments=2000000,
             for v in range(1, nvars):
                 need[spec["tensors"][v], cell["parts"][v]].add(cell["core"])
         demands.append({key: (min(users), sorted(users)) for key, users in need.items()})
-    seen, scratch = Counter(), 0
+    seen, scratch, live_outputs = Counter(), 0, set()
     for i, wave in enumerate(waves):
         step = dict(cores=sorted({cell["core"] for cell in wave}), compute_cycles=max(c["cycles"] for c in wave),
                     accesses=[], broadcast=[], shift=[], reduce=[], carry_bytes={}, reduce_compute_cycles=0)
         # Reserve accumulator + current/next input tiles (double buffer) and
         # one local partial output. Deliberate upper bound, not a free cache.
-        storage = Counter(output_storage)
+        live_outputs.update(cell["parts"][0] for cell in wave)
+        storage = Counter()
+        for parts in live_outputs:
+            storage[owners[parts]] += sum(n for _, n in parts)
         for demand in (demands[i], demands[i+1] if i+1 < len(waves) else {}):
             for (tensor, parts), (owner, users) in demand.items():
                 for core in users:
@@ -221,6 +223,7 @@ def lower_operator(spec, comp, cores, *, max_cells=200000, max_segments=2000000,
             accessed[a["core"]] += a["bytes"]
         scratch = max(scratch, max((storage[c]+accessed[c] for c in cores), default=0))
         steps.append(step)
+        live_outputs = {parts for parts in live_outputs if remaining[parts] > 0}
     return dict(steps=steps, accesses=[a for s in steps for a in s["accesses"]], cores=list(cores),
                 scratch_bytes_per_core=scratch, compute_cycles=sum(s["compute_cycles"] for s in steps),
                 work=work, logical_cells=logical_cells,
