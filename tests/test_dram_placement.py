@@ -215,6 +215,39 @@ class DRAMPlacementTest(unittest.TestCase):
         self.assertEqual(channel[key].policy, "channel_aware")
         self.assertNotEqual(software[key].bank_ids, channel[key].bank_ids)
 
+    def test_software_aware_uses_execution_graph_concurrency(self):
+        records = [
+            {
+                "tensor_id": "a", "stage": "read", "total_bytes": 300,
+                "allocation_bytes": 300, "execution_stage_id": "0:read",
+            },
+            {
+                "tensor_id": "b", "stage": "write", "total_bytes": 100,
+                "allocation_bytes": 100, "execution_stage_id": "0:write",
+            },
+            {
+                "tensor_id": "b", "stage": "read", "total_bytes": 100,
+                "allocation_bytes": 100, "execution_stage_id": "1:read",
+            },
+            {
+                "tensor_id": "c", "stage": "write", "total_bytes": 300,
+                "allocation_bytes": 300, "execution_stage_id": "1:write",
+            },
+        ]
+        plan = build_placement_plan(
+            records, total_banks=4, num_channels=2,
+            policy="software_aware", seed=0,
+        )
+        a = set(plan[record_signature(records[0])].bank_ids)
+        b = set(plan[record_signature(records[1])].bank_ids)
+        c = set(plan[record_signature(records[3])].bank_ids)
+
+        self.assertTrue(a.isdisjoint(b))
+        self.assertTrue(b.isdisjoint(c))
+        self.assertEqual(a, c)
+        self.assertEqual(len(a), 3)
+        self.assertEqual(len(b), 1)
+
     def test_non_divisible_channel_geometry_is_balanced_and_valid(self):
         plan = channel_aware_placements(make_records(), 16, 3)
         self.assertEqual(len(plan), len(make_records()))

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
-from math import ceil
+from math import ceil, lcm
 from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 import numpy as np
@@ -45,6 +45,7 @@ class DRAMRowRun:
     row_start: int
     row_count: int
     num_bytes: int
+    physical_final_row: int | None = None
 
 
 @dataclass
@@ -93,6 +94,14 @@ class DRAMStageStats:
 class DRAMScheduleResult:
     read: DRAMStageStats
     write: DRAMStageStats
+    records: List[dict]
+
+
+@dataclass
+class DRAMConcurrentResult:
+    """Joint read/write result for one compiler-concurrent operator stage."""
+
+    stats: DRAMStageStats
     records: List[dict]
 
 
@@ -483,6 +492,7 @@ class DRAMExecutionSession:
                     row_start=int(row_start),
                     row_count=row_count,
                     num_bytes=int(bank_bytes),
+                    physical_final_row=int(row_start + row_count - 1),
                 ))
         return runs, plan
 
@@ -590,8 +600,13 @@ class DRAMExecutionSession:
                 f"DRAM capacity {capacity} bytes"
             )
         self._prepared_records = list(by_signature.values())
+        placement_records = (
+            access_records
+            if self.placement_policy == "software_aware"
+            else self._prepared_records
+        )
         self._placement_plan = build_placement_plan(
-            self._prepared_records,
+            placement_records,
             geometry.total_banks,
             geometry.num_channels,
             "software_aware" if self.placement_policy.startswith("stage_aware") else self.placement_policy,
@@ -864,7 +879,11 @@ class DRAMExecutionSession:
             decisions += 1
             bank_free[run.bank_id] = finish
             channel_free[run.channel_id] = finish
-            self._open_rows[run.bank_id] = run.row_start + run.row_count - 1
+            self._open_rows[run.bank_id] = (
+                run.physical_final_row
+                if run.physical_final_row is not None
+                else run.row_start + run.row_count - 1
+            )
             activated_at[run.bank_id] = timing["final_activation"]
 
             stats.row_hits += hits
@@ -929,12 +948,84 @@ class DRAMExecutionSession:
         size = quotient * budget + min(budget, remainder)
         if size <= 0:
             raise ValueError("row budget would produce zero-byte service")
-        prefix = DRAMRowRun(run.record_index, run.bank_id, run.channel_id,
-                            run.row_start, budget, size)
-        suffix = DRAMRowRun(run.record_index, run.bank_id, run.channel_id,
-                            run.row_start + budget, run.row_count - budget,
-                            run.num_bytes - size)
+        prefix = DRAMRowRun(
+            run.record_index, run.bank_id, run.channel_id,
+            run.row_start, budget, size, run.row_start + budget - 1,
+        )
+        suffix = DRAMRowRun(
+            run.record_index, run.bank_id, run.channel_id,
+            run.row_start + budget, run.row_count - budget,
+            run.num_bytes - size, run.physical_final_row,
+        )
         return prefix, suffix
+
+    def _concurrent_window_runs(
+        self,
+        runs: Sequence[DRAMRowRun],
+    ) -> List[DRAMRowRun]:
+        """Compactly model interleaved tensor streams in one bank.
+
+        A normal row run is atomic and therefore cannot express the paper's
+        same-bank concurrent-access penalty.  For a bank shared by ``k``
+        tensor streams, a round-robin producer exposes at most
+        ``floor(FR-FCFS window / k)`` transactions from one stream before the
+        controller must expose another stream.  Row boundaries and these
+        visibility-quantum boundaries both split a run into row-buffer
+        service segments.  Their union is counted in closed form, retaining
+        O(records*banks) cost instead of expanding 128-byte transactions.
+
+        When only one tensor uses a bank, the original physical row count is
+        preserved exactly.  This makes the extra conflicts depend solely on
+        concurrent tensors sharing a bank, which is the condition targeted
+        by software-aware placement.
+        """
+        streams_per_bank: Dict[int, set[int]] = {}
+        for run in runs:
+            streams_per_bank.setdefault(run.bank_id, set()).add(
+                run.record_index
+            )
+        stream_counts = {
+            bank: len(record_indices)
+            for bank, record_indices in streams_per_bank.items()
+        }
+        transaction_bytes = max(1, int(self.dram.geometry.transaction_bytes))
+        adjusted = []
+        for run in runs:
+            stream_count = stream_counts[run.bank_id]
+            if stream_count <= 1:
+                adjusted.append(run)
+                continue
+            transactions = max(1, int(ceil(run.num_bytes / transaction_bytes)))
+            quantum = max(1, self.frfcfs_window // stream_count)
+            transactions_per_row = max(
+                1, int(ceil(transactions / run.row_count))
+            )
+            row_boundaries = min(
+                run.row_count - 1,
+                (transactions - 1) // transactions_per_row,
+            )
+            quantum_boundaries = (transactions - 1) // quantum
+            shared_boundaries = (transactions - 1) // lcm(
+                transactions_per_row, quantum
+            )
+            service_segments = min(
+                transactions,
+                1 + row_boundaries + quantum_boundaries - shared_boundaries,
+            )
+            adjusted.append(DRAMRowRun(
+                record_index=run.record_index,
+                bank_id=run.bank_id,
+                channel_id=run.channel_id,
+                row_start=run.row_start,
+                row_count=service_segments,
+                num_bytes=run.num_bytes,
+                physical_final_row=(
+                    run.physical_final_row
+                    if run.physical_final_row is not None
+                    else run.row_start + run.row_count - 1
+                ),
+            ))
+        return adjusted
 
     def schedule_records(
         self,
@@ -1001,6 +1092,84 @@ class DRAMExecutionSession:
             for record in records:
                 record["dram_noc_cycles"] = 0
         result = DRAMScheduleResult(read=read, write=write, records=records)
+        if self.observer is not None:
+            self.observer(self, op_index, result)
+        return result
+
+    def schedule_concurrent_records(
+        self,
+        access_records: Sequence[Mapping[str, object]],
+        op_index: int,
+    ) -> DRAMConcurrentResult:
+        """Schedule one operator's reads and writes as a concurrent stream.
+
+        The software-aware mapping described by the Voxel paper derives
+        concurrency from singular/fused operators, including an output write
+        overlapping input prefetch.  The legacy :meth:`schedule_records` API
+        deliberately retains separate read and write timing stages.  This
+        explicit API instead places both directions in one bounded FR-FCFS
+        window and is intended for conflict/interference studies.
+
+        Runs are ordered bank-major so records targeting the same bank become
+        jointly visible to the controller.  This preserves O(records*banks)
+        scheduling cost while avoiding record-major serialization.  Mixed
+        direction NoC timing is intentionally unsupported because reads and
+        writes route in opposite directions; callers needing NoC latency must
+        continue to use :meth:`schedule_records`.
+        """
+        if self.noc is not None:
+            raise ValueError(
+                "concurrent read/write DRAM scheduling does not support NoC timing"
+            )
+        records = [dict(record) for record in access_records]
+        self.counterfactual = (
+            self.requested_counterfactual
+            if self.counterfactual_op_indices is None
+            or op_index in self.counterfactual_op_indices
+            else "none"
+        )
+        runs, plan = self._row_runs(records, op_index)
+        if self.frozen is None:
+            runs = self._concurrent_window_runs(runs)
+        elif not self.frozen["operations"][str(op_index)].get(
+            "concurrent_window_model"
+        ):
+            raise ValueError(
+                "frozen replay operation lacks concurrent-window metadata"
+            )
+        runs = sorted(
+            runs,
+            key=lambda run: (
+                run.channel_id,
+                run.bank_id,
+                run.record_index,
+                run.row_start,
+            ),
+        )
+        self.snapshot["operations"][str(op_index)] = {
+            "logical_hash": self.logical_hash(access_records),
+            "records": [self.logical_record(record) for record in access_records],
+            "runs": [asdict(run) for run in runs],
+            "concurrent_read_write": True,
+            "concurrent_window_model": "round_robin_visible_quantum_v1",
+        }
+        for record in records:
+            signature = record_signature(record)
+            placement = plan.get(signature)
+            if placement is None:
+                continue
+            record.update({
+                "source": "tsim_dram_execution_session_concurrent",
+                "placement_policy": self.placement_policy,
+                "bank_ids": list(placement.bank_ids),
+                "channel_ids": list(placement.channel_ids),
+                "address": int(self._tensor_addresses[signature]),
+                "allocation_bytes": int(allocation_bytes(record)),
+            })
+        stats = self._schedule_stage(runs, records)
+        stats.dram_cycles = int(stats.cycles)
+        completion_breakdown(stats)
+        result = DRAMConcurrentResult(stats=stats, records=records)
         if self.observer is not None:
             self.observer(self, op_index, result)
         return result

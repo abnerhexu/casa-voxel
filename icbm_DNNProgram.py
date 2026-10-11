@@ -2023,6 +2023,7 @@ class DNNProgram:
                 dram_access_records.extend(last_op_write_records)
             for record in dram_access_records:
                 record["execution_stage_id"] = f"{idx}:{record.get('stage', '')}"
+                record["execution_op_id"] = int(idx)
             prepared_dram_ops.append((
                 int(dram_r_traffic),
                 int(dram_w_traffic),

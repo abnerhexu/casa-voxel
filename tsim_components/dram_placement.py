@@ -9,6 +9,7 @@ requests without reimplementing policy logic.
 from __future__ import annotations
 
 import hashlib
+from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from math import ceil, floor
@@ -171,7 +172,33 @@ def software_aware_placements(
     total_banks: int,
     seed: int = 0,
 ) -> Dict[RecordSignature, TensorPlacement]:
-    """Reproduce the existing size-proportional contiguous-bank strategy."""
+    """Place tensors using execution-graph concurrency when it is available.
+
+    The paper's software-aware policy treats all tensors of one singular or
+    fused operator as concurrent.  It also treats the preceding operator's
+    outputs and the next operator's inputs as concurrent.  Concurrent tensors
+    receive disjoint bank sets weighted by allocation size; tensors that are
+    never live together may reuse the same banks.  The paper does not publish
+    allocator pseudocode, so this implementation completes the stated policy
+    as deterministic weighted multicoloring.  It balances remaining demand
+    fraction, absolute demand, and traffic in that order.
+
+    Older traces do not contain ``execution_stage_id`` metadata.  They retain
+    the historical size-proportional contiguous placement as a compatibility
+    fallback, rather than silently inventing execution-graph relationships.
+    """
+    records = tuple(record for record in records if record_bytes(record) > 0)
+    if records and all(record.get("execution_stage_id") is not None for record in records):
+        return _execution_graph_aware_placements(records, total_banks, seed)
+    return _size_proportional_contiguous_placements(records, total_banks, seed)
+
+
+def _size_proportional_contiguous_placements(
+    records: Iterable[Mapping[str, object]],
+    total_banks: int,
+    seed: int = 0,
+) -> Dict[RecordSignature, TensorPlacement]:
+    """Compatibility implementation used by traces without graph metadata."""
     total_banks = max(1, int(total_banks))
     ordered = sorted(
         (record for record in records if record_bytes(record) > 0),
@@ -188,6 +215,118 @@ def software_aware_placements(
             channel_ids=tuple(),
         )
         cursor += span
+    return result
+
+
+def _execution_op_id(record: Mapping[str, object]) -> str:
+    """Return the operator identity encoded in an execution-stage record."""
+    explicit = record.get("execution_op_id")
+    if explicit is not None:
+        return str(explicit)
+    stage = str(record["execution_stage_id"])
+    prefix, separator, suffix = stage.rpartition(":")
+    if separator and suffix.lower() in {"read", "write"}:
+        return prefix
+    return stage
+
+
+def _execution_graph_aware_placements(
+    records: Sequence[Mapping[str, object]],
+    total_banks: int,
+    seed: int = 0,
+) -> Dict[RecordSignature, TensorPlacement]:
+    """Greedily color the paper-defined tensor concurrency graph."""
+    total_banks = max(1, int(total_banks))
+    allocations: Dict[RecordSignature, int] = {}
+    traffic: Dict[RecordSignature, int] = defaultdict(int)
+    op_records: Dict[str, list[Mapping[str, object]]] = defaultdict(list)
+    op_order: list[str] = []
+    for record in records:
+        signature = record_signature(record)
+        allocations[signature] = max(
+            allocations.get(signature, 0), allocation_bytes(record)
+        )
+        traffic[signature] += record_bytes(record)
+        op_id = _execution_op_id(record)
+        if op_id not in op_records:
+            op_order.append(op_id)
+        op_records[op_id].append(record)
+
+    # Each op is a concurrency clique.  The producer-output/consumer-input
+    # clique across adjacent ops captures prefetch overlapping an output write.
+    groups: list[Tuple[RecordSignature, ...]] = []
+    for op_index, op_id in enumerate(op_order):
+        signatures = tuple(sorted({record_signature(r) for r in op_records[op_id]}))
+        if signatures:
+            groups.append(signatures)
+        if op_index + 1 < len(op_order):
+            next_id = op_order[op_index + 1]
+            preceding_outputs = {
+                record_signature(record)
+                for record in op_records[op_id]
+                if str(record.get("stage", "")).lower() == "write"
+            }
+            following_inputs = {
+                record_signature(record)
+                for record in op_records[next_id]
+                if str(record.get("stage", "")).lower() == "read"
+            }
+            boundary = tuple(sorted(preceding_outputs | following_inputs))
+            if boundary:
+                groups.append(boundary)
+
+    neighbours: Dict[RecordSignature, set[RecordSignature]] = {
+        signature: set() for signature in allocations
+    }
+    desired_span = {signature: total_banks for signature in allocations}
+    for group in groups:
+        spans = _proportional_spans(
+            [allocations[signature] for signature in group], total_banks
+        )
+        for signature, span in zip(group, spans):
+            desired_span[signature] = min(desired_span[signature], span)
+            neighbours[signature].update(
+                other for other in group if other != signature
+            )
+
+    # Weighted multicoloring: every physical bank is assigned to a maximal
+    # independent set of tensors.  A tensor receives ``desired_span`` colors
+    # (banks); adjacent tensors can never share a color, while tensors from
+    # distant execution stages naturally reuse banks.  Balancing by remaining
+    # demand fraction prevents large tensors from starving small operands.
+    bank_order = _rotating_indices(total_banks, int(seed), total_banks)
+    assigned: Dict[RecordSignature, list[int]] = {
+        signature: [] for signature in allocations
+    }
+    unmet = dict(desired_span)
+    for bank in bank_order:
+        candidates = sorted(
+            (signature for signature in allocations if unmet[signature] > 0),
+            key=lambda item: (
+                -unmet[item] / max(1, desired_span[item]),
+                -unmet[item],
+                -traffic[item],
+                item,
+            ),
+        )
+        selected: set[RecordSignature] = set()
+        for signature in candidates:
+            if neighbours[signature].isdisjoint(selected):
+                selected.add(signature)
+                assigned[signature].append(bank)
+                unmet[signature] -= 1
+
+    result: Dict[RecordSignature, TensorPlacement] = {}
+    for signature in sorted(allocations):
+        banks = tuple(assigned[signature])
+        if not banks:
+            raise ValueError(
+                "software-aware multicoloring could not allocate a bank to "
+                f"tensor {signature!r}"
+            )
+        result[signature] = TensorPlacement(
+            policy="software_aware", bank_ids=banks, channel_ids=tuple()
+        )
     return result
 
 
@@ -564,7 +703,17 @@ def build_placement_plan(
     channel count or policy therefore recomputes placement without evicting
     or invalidating the independent tiling cache.
     """
+    records = tuple(records)
     normalized_policy = str(policy).lower().replace("-", "_")
+    # The paper-faithful software-aware policy needs every occurrence of a
+    # tensor and its execution-stage metadata.  Coalescing to allocations here
+    # would erase exactly the concurrency graph that drives the placement.
+    if (
+        normalized_policy == "software_aware"
+        and records
+        and all(record.get("execution_stage_id") is not None for record in records)
+    ):
+        return software_aware_placements(records, total_banks, seed)
     # Placement operates on physical allocations, not individual accesses.
     # Coalesce repeated reads/writes of one tensor and use its largest known
     # allocation while retaining one stable base address.

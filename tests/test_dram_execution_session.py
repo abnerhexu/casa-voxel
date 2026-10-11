@@ -111,6 +111,55 @@ class DRAMExecutionSessionTest(unittest.TestCase):
         self.assertEqual(result.write.row_conflicts, 0)
         self.assertEqual(result.records[1]["total_row_conflicts"], 0)
 
+    def test_concurrent_api_jointly_schedules_reads_and_writes(self):
+        records = [record("read", 0, 512), record("write", 1, 512)]
+        for item in records:
+            item["execution_stage_id"] = f"0:{item['stage']}"
+            item["execution_op_id"] = 0
+        session = make_dram(banks=4, channels=1).new_execution_session(
+            placement_policy="uniform", replication_factor=1
+        )
+
+        result = session.schedule_concurrent_records(records, op_index=0)
+
+        self.assertEqual(result.stats.num_bytes, 1024)
+        self.assertEqual(
+            result.stats.row_hits
+            + result.stats.row_misses
+            + result.stats.row_conflicts,
+            4,
+        )
+        self.assertEqual(
+            {record["stage"] for record in result.records}, {"read", "write"}
+        )
+
+    def test_concurrent_window_exposes_same_bank_tensor_interference(self):
+        records = [record("read", 0, 16 * 1024), record("write", 1, 16 * 1024)]
+        for item in records:
+            item["allocation_bytes"] = item["total_bytes"]
+            item["access_granularity_bytes"] = 8 * 1024
+            item["execution_stage_id"] = f"0:{item['stage']}"
+            item["execution_op_id"] = 0
+
+        uniform = make_dram(banks=2, row_bytes=8 * 1024).new_execution_session(
+            placement_policy="uniform", replication_factor=1, frfcfs_window=4
+        )
+        software = make_dram(banks=2, row_bytes=8 * 1024).new_execution_session(
+            placement_policy="software_aware", replication_factor=1,
+            frfcfs_window=4,
+        )
+        uniform.prepare_records(records)
+        software.prepare_records(records)
+
+        uniform_result = uniform.schedule_concurrent_records(records, op_index=0)
+        software_result = software.schedule_concurrent_records(records, op_index=0)
+
+        self.assertGreater(
+            uniform_result.stats.row_conflicts,
+            software_result.stats.row_conflicts,
+        )
+        self.assertEqual(software_result.stats.row_conflicts, 2)
+
     def test_global_prepare_allocates_distinct_non_overlapping_tensors(self):
         session = make_dram(banks=4, channels=1).new_execution_session(
             placement_policy="address_trace", replication_factor=1

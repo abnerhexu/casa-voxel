@@ -262,7 +262,8 @@ conflict counts, and conflict energy. Open rows persist between fused
 operators, and a bounded hit-first request window approximates FR-FCFS without
 requiring Ramulator. Row runs are coalesced per bank, so simulation work is
 bounded by tensor records times banks instead of the number of 128-byte
-transactions. tRAS is not modelled.
+transactions. Explicit configurations may enforce the true earliest-precharge
+constraint `PRE >= ACT + tRAS`; legacy configurations retain `tRAS=0`.
 
 DRAM configurations may describe physical geometry explicitly with
 `num_layers`, `banks_per_layer`, `num_channels`, `bytes_per_row`, and
@@ -284,17 +285,34 @@ change the number of transactions or row conflicts. The internal precise path
 returns the completion time of the slowest channel. Multi-channel runs use
 this internal path even when an external single-channel backend was requested.
 
-The independent `channel_aware` placement policy extends `software_aware` with
-explicit channel load balancing. It assigns large tensor records first to the
-least-loaded channels, selects deterministic bank stripes inside each channel,
-and maintains separate read/write cursors. A channel-count sweep therefore
+When execution-stage metadata is present, `software_aware` constructs the
+paper-defined tensor interference graph: all tensors of one singular/fused
+operator are concurrent, as are a preceding output and the following inputs.
+Deterministic weighted multicoloring gives concurrent tensors disjoint,
+allocation-size-weighted bank sets and lets non-concurrent tensors reuse banks.
+The paper specifies the concurrency rule but not allocator pseudocode; the
+multicoloring is Voxel's deterministic completion of that rule, not a claimed
+verbatim paper implementation. Traces without execution metadata use the
+legacy contiguous size-proportional fallback. The independent
+`channel_aware` policy assigns large tensor records first to the least-loaded
+channels, selects deterministic bank stripes inside each channel, and
+maintains separate read/write cursors. A channel-count sweep therefore
 recomputes placement while retaining the selected spatial/temporal tiling.
+
+Conflict studies can schedule all tensors of an operator with the explicit
+concurrent API. A bank shared by multiple tensor streams uses a compact
+round-robin visibility model: the bounded FR-FCFS window exposes at most its
+fair-share transactions from one stream before another stream becomes
+visible. Physical row boundaries and visibility-quantum boundaries are merged
+in closed form, so same-bank tensor interference is represented without
+expanding a multi-GiB access into 128-byte request objects. Single-stream
+banks retain the ordinary physical row-run count exactly.
 Use `--dram_placement` to select `address_trace`, `hbm_interleave`, `uniform`,
 `interleave_size`, `software_aware`, `channel_aware`, or `noc_aware`; the
 selected physical banks are retained in tensor access records so thermal
-mapping can consume the same execution placement. `noc_aware` keeps the
-size-proportional bank spans of `software_aware`, then chooses concrete banks
-using requester-traffic-weighted mesh hops and channel load. For X channels
+mapping can consume the same execution placement. `noc_aware` uses the legacy
+global size-proportional span rule, then chooses concrete banks using
+requester-traffic-weighted mesh hops and channel load. For X channels
 and Y dimension-ordered mesh cores, it partitions the core IDs into X balanced
 contiguous groups (sizes differ by at most one) and binds each channel to the
 lower middle core of its group. X must not exceed Y. Because this policy needs
@@ -311,7 +329,9 @@ uses a separate LRU keyed by tensor access records, policy, channel count, bank
 geometry, and placement seed. `DNNProgram.save_tiling_cache()` and
 `load_tiling_cache()` persist only tiling choices, while
 `placement_cache_info()` and `clear_placement_cache()` inspect or clear only
-placement state. Program pickles created before this split remain readable.
+placement state. Execution-graph-aware plans bypass the allocation-only cache
+because coalescing occurrences would erase concurrency metadata. Program
+pickles created before this split remain readable.
 
 Every `run_tsim()` result now includes a versioned `stats["experiment"]`
 record. `parse_results()` writes every design point—not only the selected
