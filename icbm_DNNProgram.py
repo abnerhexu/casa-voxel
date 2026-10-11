@@ -79,6 +79,18 @@ STACKED_3D_DRAM_PJ_PER_BYTE = 7
 DRAM_ACT_PRE_ENERGY_PJ = 7.27 * 1_000
 """Additional dynamic energy of one row-conflict PRE+ACT pair (7.27 nJ)."""
 
+
+def chip_sharded_requester_weights(total_bytes: int, num_cores: int):
+    """Split chip-wide tensor traffic into one physical shard per core."""
+    total_bytes = max(0, int(total_bytes))
+    num_cores = max(1, int(num_cores))
+    quotient, remainder = divmod(total_bytes, num_cores)
+    return [
+        [core, quotient + (1 if core < remainder else 0)]
+        for core in range(num_cores)
+        if quotient + (1 if core < remainder else 0) > 0
+    ]
+
 def convert_tuple_to_list(t):
     """Recursively convert nested tuples to nested lists."""
     return [convert_tuple_to_list(x) for x in t] if isinstance(t, tuple) else t
@@ -1526,17 +1538,19 @@ class DNNProgram:
             )
             return int(TE.shape_to_size(shape) * op.expr.num_byte_per_elem)
 
-        def requester_weights(spatial_replicas, tensor_index, total_bytes):
-            requester_count = max(1, min(
-                int(self.tot_num_cores),
-                int(spatial_replicas[tensor_index]),
-            ))
-            quotient, remainder = divmod(int(total_bytes), requester_count)
-            return [
-                [core, quotient + (1 if core < remainder else 0)]
-                for core in range(requester_count)
-                if quotient + (1 if core < remainder else 0) > 0
-            ]
+        def requester_weights(_spatial_replicas, _tensor_index, total_bytes):
+            # ``load_bytes`` is a per-core quantity and callers form
+            # ``total_bytes`` by multiplying it by ``tot_num_cores``.  A
+            # spatial replica count describes how many copies of a logical
+            # tensor exist across the machine; it is not the number of cores
+            # that receive their physical shard.  Assigning all chip-wide
+            # bytes to only ``spatial_replicas[tensor_index]`` cores (often
+            # one for a weight tensor) spuriously funnels the entire tensor
+            # through core 0 and double-counts compute-shift NoC movement.
+            # Every executing core instead receives its per-core DRAM shard.
+            return chip_sharded_requester_weights(
+                total_bytes, self.tot_num_cores
+            )
 
         for (idx, op) in enumerate(fused_op):
             (temporal, spatial) = next(partition_it)

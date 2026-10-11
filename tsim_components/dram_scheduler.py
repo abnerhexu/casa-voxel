@@ -160,47 +160,75 @@ def _directed_noc_links(noc) -> Tuple[Tuple[int, int], ...]:
     return links
 
 
-def _dram_noc_route_profiles(noc, channel_nodes, demand, stage):
-    """Return cached channel-by-link traffic fractions for one demand shape."""
-    total_demand = sum(weight for _core, weight in demand)
-    demand_key = tuple(
-        (int(core), round(float(weight) / total_demand, 15))
-        for core, weight in demand
-    )
-    cache = getattr(noc, "_dram_noc_route_profile_cache", None)
-    if cache is None:
-        cache = {}
-        noc._dram_noc_route_profile_cache = cache
-    key = (tuple(int(node) for node in channel_nodes), demand_key, str(stage))
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
+def _locality_matched_dram_flows(
+    noc,
+    channel_nodes,
+    channel_weights: Mapping[int, float],
+    demand: Sequence[Tuple[int, float]],
+) -> Tuple[Tuple[int, int, float, Tuple[int, ...]], ...]:
+    """Match placed channel shards to requester shards by physical locality.
 
-    links = _directed_noc_links(noc)
-    link_index = {link: index for index, link in enumerate(links)}
-    profiles = np.zeros((len(channel_nodes), len(links)), dtype=np.float64)
-    average_hops = np.zeros(len(channel_nodes), dtype=np.float64)
-    max_hops = np.zeros(len(channel_nodes), dtype=np.int64)
-    for channel, endpoint in enumerate(channel_nodes):
-        for (core, _weight), (_key_core, fraction) in zip(demand, demand_key):
-            source, destination = (
-                (int(endpoint), int(core))
-                if stage == "read" else (int(core), int(endpoint))
-            )
-            path = noc.get_dimension_ordered_path(source, destination)
-            hops = max(0, len(path) - 1)
-            average_hops[channel] += fraction * hops
-            max_hops[channel] = max(max_hops[channel], hops)
-            for u, v in zip(path, path[1:]):
-                profiles[channel, link_index[(int(u), int(v))]] += fraction
-    cached = (profiles, average_hops, max_hops, links)
-    # A sweep normally reuses only a small set of requester shapes, but cap
-    # this potentially large channel-by-link matrix cache for adversarial or
-    # imported traces with one unique demand vector per tensor.
-    if len(cache) >= 128:
-        cache.pop(next(iter(cache)))
-    cache[key] = cached
-    return cached
+    ``requester_core_weights`` describes a partitioned tensor: its weights
+    are mutually exclusive byte shards, not a broadcast fanout.  Applying
+    the complete requester distribution independently to every channel would
+    destroy dimension-ordered tile mapping and route most tensor bytes across
+    the middle of the mesh.  Instead, greedily match remaining channel supply
+    and requester demand by shortest dimension-ordered path.  Stable
+    channel/core tie breaks make this a deterministic placement replay.
+    """
+    supplies = {
+        int(channel): float(weight)
+        for channel, weight in channel_weights.items()
+        if float(weight) > 0
+    }
+    demands = {
+        int(core): float(weight)
+        for core, weight in demand
+        if float(weight) > 0
+    }
+    supply_total = sum(supplies.values())
+    demand_total = sum(demands.values())
+    if supply_total <= 0 or demand_total <= 0:
+        return tuple()
+    # Imported traces may encode relative requester weights. Normalize them
+    # to the exact scheduled byte supply before constructing physical flows.
+    scale = supply_total / demand_total
+    demands = {core: weight * scale for core, weight in demands.items()}
+    paths = {}
+    for channel in supplies:
+        endpoint = int(channel_nodes[channel])
+        for core in demands:
+            path = tuple(int(node) for node in noc.get_dimension_ordered_path(
+                endpoint, core
+            ))
+            paths[(channel, core)] = path
+
+    flows = []
+    epsilon = max(1e-9, supply_total * 1e-12)
+    while supplies and demands:
+        channel, core = min(
+            (
+                (channel, core)
+                for channel in supplies
+                for core in demands
+            ),
+            key=lambda pair: (
+                len(paths[pair]) - 1,
+                pair[0],
+                pair[1],
+            ),
+        )
+        amount = min(supplies[channel], demands[core])
+        flows.append((channel, core, amount, paths[(channel, core)]))
+        supplies[channel] -= amount
+        demands[core] -= amount
+        if supplies[channel] <= epsilon:
+            del supplies[channel]
+        if demands[core] <= epsilon:
+            del demands[core]
+    if supplies or demands:
+        raise AssertionError("DRAM channel/requester matching did not conserve bytes")
+    return tuple(flows)
 
 
 def _attach_dram_noc_stats(
@@ -260,24 +288,27 @@ def _attach_dram_noc_stats(
         if total_demand <= 0:
             continue
 
-        profiles, average_hops, channel_max_hops, profile_links = (
-            _dram_noc_route_profiles(
-                noc, channel_nodes, demand, stage
+        flows = _locality_matched_dram_flows(
+            noc, channel_nodes, channel_weights, demand
+        )
+        link_index = {link: index for index, link in enumerate(directed_links)}
+        record_link_loads = np.zeros(len(directed_links), dtype=np.float64)
+        record_byte_hops = 0.0
+        record_max_hops = 0
+        for _channel, _core, flow_bytes, forward_path in flows:
+            path = (
+                forward_path
+                if stage == "read" else tuple(reversed(forward_path))
             )
-        )
-        if profile_links != directed_links:
-            raise AssertionError("cached DRAM NoC link ordering changed")
-        channel_vector = np.zeros(num_channels, dtype=np.float64)
-        for channel, channel_bytes in channel_weights.items():
-            channel_vector[channel] = float(channel_bytes)
-        record_link_loads = channel_vector @ profiles
+            hops = max(0, len(path) - 1)
+            record_byte_hops += float(flow_bytes) * hops
+            record_max_hops = max(record_max_hops, hops)
+            for source, destination in zip(path, path[1:]):
+                record_link_loads[
+                    link_index[(int(source), int(destination))]
+                ] += float(flow_bytes)
         stage_link_loads += record_link_loads
-        record_byte_hops = float(channel_vector @ average_hops)
-        active_channels = np.flatnonzero(channel_vector)
-        record_max_hops = int(
-            max((channel_max_hops[channel] for channel in active_channels), default=0)
-        )
-        record_flow_count = int(len(active_channels) * len(demand))
+        record_flow_count = len(flows)
         record_max_link = float(np.max(record_link_loads, initial=0.0))
         record_noc_cycles = 0
         if record_max_link > 0:
@@ -365,6 +396,7 @@ class DRAMExecutionSession:
         row_budget: int | None = None,
         max_bypass: int = 32,
         fixed_bank_order: bool = False,
+        concurrent_window_model: bool = False,
         counterfactual: str = "none",
         counterfactual_op_indices=None,
     ) -> None:
@@ -388,6 +420,7 @@ class DRAMExecutionSession:
         self.row_budget = row_budget
         self.max_bypass = max_bypass
         self.fixed_bank_order = fixed_bank_order
+        self.concurrent_window_model = bool(concurrent_window_model)
         if counterfactual not in (
             "none", "no_row_conflict_penalty", "ideal_row_switch",
             "ideal_dram_noc", "ideal_dram", "ideal_memory",
@@ -1049,10 +1082,23 @@ class DRAMExecutionSession:
                               if self.counterfactual_op_indices is None or op_index in self.counterfactual_op_indices
                               else "none")
         runs, plan = self._row_runs(records, op_index)
+        if self.concurrent_window_model:
+            if self.frozen is None:
+                runs = self._concurrent_window_runs(runs)
+            elif not self.frozen["operations"][str(op_index)].get(
+                "concurrent_window_model"
+            ):
+                raise ValueError(
+                    "frozen replay operation lacks concurrent-window metadata"
+                )
         self.snapshot["operations"][str(op_index)] = {
             "logical_hash": self.logical_hash(access_records),
             "records": [self.logical_record(r) for r in access_records],
             "runs": [asdict(run) for run in runs],
+            "concurrent_window_model": (
+                "round_robin_visible_quantum_v1"
+                if self.concurrent_window_model else None
+            ),
         }
         for record in records:
             signature = record_signature(record)

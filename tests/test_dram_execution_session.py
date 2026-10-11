@@ -1,5 +1,6 @@
 import unittest
 
+from icbm_DNNProgram import chip_sharded_requester_weights
 from tsim_components.mem import DRAM
 from tsim_components.noc import NoC, Topo
 
@@ -34,6 +35,12 @@ def record(stage, tensor_index, size):
 
 
 class DRAMExecutionSessionTest(unittest.TestCase):
+    def test_chip_wide_traffic_is_sharded_across_every_executing_core(self):
+        weights = chip_sharded_requester_weights(1025, 4)
+
+        self.assertEqual(weights, [[0, 257], [1, 256], [2, 256], [3, 256]])
+        self.assertEqual(sum(weight for _core, weight in weights), 1025)
+
     def test_tras_delays_earliest_precharge(self):
         result = make_dram(tras=34).new_execution_session(
             placement_policy="uniform", replication_factor=1
@@ -160,6 +167,47 @@ class DRAMExecutionSessionTest(unittest.TestCase):
         )
         self.assertEqual(software_result.stats.row_conflicts, 2)
 
+    def test_pipeline_concurrent_window_preserves_noc_and_exposes_placement(self):
+        records = [
+            record("read", 0, 16 * 1024),
+            record("read", 1, 16 * 1024),
+            record("write", 2, 16 * 1024),
+        ]
+        for item in records:
+            item["allocation_bytes"] = item["total_bytes"]
+            item["access_granularity_bytes"] = 8 * 1024
+            item["execution_stage_id"] = f"0:{item['stage']}"
+            item["execution_op_id"] = 0
+            item["requester_core_weights"] = [[0, item["total_bytes"]]]
+        noc = NoC(16, Topo.MESH, list(range(4)))
+
+        def run(policy, counterfactual="none"):
+            dram = make_dram(banks=4, channels=2, row_bytes=8 * 1024)
+            dram.execution_options = {
+                "concurrent_window_model": True,
+                "counterfactual": counterfactual,
+            }
+            session = dram.new_execution_session(
+                placement_policy=policy,
+                replication_factor=1,
+                frfcfs_window=4,
+                noc=noc,
+            )
+            session.prepare_records(records)
+            return session.schedule_records(records, op_index=0)
+
+        uniform = run("uniform")
+        software = run("software_aware")
+        no_conflict = run("uniform", "no_row_conflict_penalty")
+
+        self.assertGreater(
+            uniform.read.row_conflicts + uniform.write.row_conflicts,
+            software.read.row_conflicts + software.write.row_conflicts,
+        )
+        self.assertGreater(uniform.read.noc_byte_hops, 0)
+        self.assertEqual(uniform.read.noc_byte_hops, no_conflict.read.noc_byte_hops)
+        self.assertLessEqual(no_conflict.read.dram_cycles, uniform.read.dram_cycles)
+
     def test_global_prepare_allocates_distinct_non_overlapping_tensors(self):
         session = make_dram(banks=4, channels=1).new_execution_session(
             placement_policy="address_trace", replication_factor=1
@@ -250,6 +298,23 @@ class DRAMExecutionSessionTest(unittest.TestCase):
         self.assertEqual(far.read.noc_cycles, 31)
         self.assertLess(near.read.noc_cycles, far.read.noc_cycles)
         self.assertLess(near.read.cycles, far.read.cycles)
+
+    def test_dimension_ordered_channel_shards_stay_with_local_requesters(self):
+        noc = NoC(16, Topo.MESH, list(range(4)))
+        dram = make_dram(banks=4, channels=4, bytepc=1024)
+        session = dram.new_execution_session(
+            placement_policy="uniform", replication_factor=1, noc=noc
+        )
+        access = record("read", 0, 512)
+        access["access_granularity_bytes"] = 128
+        access["requester_core_weights"] = [
+            [core, 128] for core in range(4)
+        ]
+
+        result = session.schedule_records([access], op_index=0)
+
+        self.assertEqual(result.read.noc_byte_hops, 0)
+        self.assertEqual(result.read.noc_cycles, 0)
 
 
 if __name__ == "__main__":
