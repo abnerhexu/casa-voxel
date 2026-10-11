@@ -440,7 +440,8 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
              core_group_size:int, dram_bandwidth_GBps:int, npu_freq_MHz:int, tot_layers:int, sim_layers:int,
              dram_name:str = "unspec_mem", spmd_compiler:bool = False, seq_noc:bool = False,
              aggregate_scale:float = 1.0,
-             tiling_override:Optional[Sequence[Tuple[object, object]]] = None) -> \
+             tiling_override:Optional[Sequence[Tuple[object, object]]] = None,
+             collect_overlap:bool = True) -> \
             Tuple[HardwareConfig, int, int, List[FusedOperatorExecLog], List[OverlapInterval]]:
     """Run a full temporal simulation for one hardware configuration.
 
@@ -473,6 +474,9 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         dram_name: Human-readable DRAM identifier for output paths.
         spmd_compiler: If True, simulate a naive compiler (worse NoC mapping).
         seq_noc: If True, simulate a degraded NoC.
+        collect_overlap: If False, skip construction of the detailed overlap
+            intervals while preserving execution timing and aggregate stats.
+            This is useful for large tiling sweeps that consume only latency.
 
     Returns:
         A 4-tuple of:
@@ -734,7 +738,9 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
         overlap_intervals =[]
     print("Computing execution statistics took", time.time() - exec_stat_start, "seconds")
     print("Finding overlap...")
-    overlap_intervals = get_overlap(fused_op_logs, 250)
+    overlap_intervals = (
+        get_overlap(fused_op_logs, 250) if collect_overlap else []
+    )
 
     row = dram.bytes_per_row//dram.bytes_per_cycle
     hw_cfg = HardwareConfig(comp_op.comp,

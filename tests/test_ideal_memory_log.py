@@ -25,7 +25,10 @@ def test_idealized_store_keeps_bytes_energy_and_finish(mode):
         log.sanity_check()
 
 
-@pytest.mark.parametrize("mode", ["none", "ideal_dram_noc", "ideal_row_switch", "unknown"])
+@pytest.mark.parametrize("mode", [
+    "none", "ideal_dram_noc", "ideal_row_switch",
+    "no_row_conflict_penalty", "unknown",
+])
 def test_nonidealized_store_still_rejected(mode):
     with pytest.raises(AssertionError, match="write bytes"):
         make_log(mode)

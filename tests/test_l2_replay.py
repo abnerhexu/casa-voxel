@@ -106,6 +106,18 @@ class FrozenReplayTest(unittest.TestCase):
         self.assertEqual(ideal.row_conflicts, baseline.row_conflicts)
         self.assertEqual(ideal.num_bytes, baseline.num_bytes)
 
+    def test_no_row_conflict_penalty_retains_initial_activation(self):
+        records = [record("read", 1, 1024)]
+        baseline = self.session(make_dram()).schedule_records(records, 0).read
+        no_conflict = self.session(
+            make_dram(), counterfactual="no_row_conflict_penalty"
+        ).schedule_records(records, 0).read
+        # Four rows retain four CLs, the first cold ACT retains one tRCD,
+        # and the three subsequent PRE+tRCD conflict penalties disappear.
+        self.assertEqual(no_conflict.cycles, 4 * 14 + 14 + 32)
+        self.assertEqual(no_conflict.row_conflicts, baseline.row_conflicts)
+        self.assertLess(no_conflict.cycles, baseline.cycles)
+
     def test_analytical_estimates_are_not_logical_identity(self):
         records = [record("read", 1, 1024)]
         records[0].update(cycles_per_core=100, scheduled_cycles=100, total_row_conflicts=2)

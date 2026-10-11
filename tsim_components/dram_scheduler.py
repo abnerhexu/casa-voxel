@@ -388,7 +388,10 @@ class DRAMExecutionSession:
         self.row_budget = row_budget
         self.max_bypass = max_bypass
         self.fixed_bank_order = fixed_bank_order
-        if counterfactual not in ("none", "ideal_row_switch", "ideal_dram_noc", "ideal_dram", "ideal_memory"):
+        if counterfactual not in (
+            "none", "no_row_conflict_penalty", "ideal_row_switch",
+            "ideal_dram_noc", "ideal_dram", "ideal_memory",
+        ):
             raise ValueError("unknown counterfactual")
         self.counterfactual = counterfactual
         self.requested_counterfactual = counterfactual
@@ -762,7 +765,9 @@ class DRAMExecutionSession:
                 timing = row_timing(candidate_run)
                 candidate_hit = bool(timing["hits"])
                 candidate_row_ready = int(timing["row_ready"])
-                if self.counterfactual == "ideal_row_switch":
+                if self.counterfactual == "no_row_conflict_penalty":
+                    candidate_row_ready = int(timing["no_conflict_row_ready"])
+                elif self.counterfactual == "ideal_row_switch":
                     candidate_row_ready = (
                         bank_free[candidate_run.bank_id]
                         + candidate_run.row_count * int(self.dram.CL)
@@ -820,7 +825,13 @@ class DRAMExecutionSession:
             transfer_cycles = max(
                 1, int(ceil(run.num_bytes / self._chip_channel_bytes_per_cycle))
             )
-            if self.counterfactual == "ideal_row_switch":
+            if self.counterfactual == "no_row_conflict_penalty":
+                # Retain the initial ACT/tRCD miss and all column latency, but
+                # remove only PRE/ACT delay caused by replacing an open row.
+                # This is the counterfactual needed for the paper's shaded
+                # row-buffer-conflict execution-time overhead.
+                row_ready = int(timing["no_conflict_row_ready"])
+            elif self.counterfactual == "ideal_row_switch":
                 row_ready = bank_free[run.bank_id] + run.row_count * int(self.dram.CL)
             elif self.counterfactual in ("ideal_dram", "ideal_memory"):
                 row_ready = bank_free[run.bank_id]
