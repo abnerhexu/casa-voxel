@@ -4,11 +4,12 @@ from tsim_components.mem import DRAM
 from tsim_components.noc import NoC, Topo
 
 
-def make_dram(*, banks=1, channels=1, row_bytes=256, bytepc=32):
+def make_dram(*, banks=1, channels=1, row_bytes=256, bytepc=32, tras=0):
     return DRAM(
         CL=14,
         tRCD=14,
         tRP=14,
+        tRAS=tras,
         bytes_per_row=row_bytes,
         bytes_per_cycle=bytepc,
         num_cores=1,
@@ -33,6 +34,37 @@ def record(stage, tensor_index, size):
 
 
 class DRAMExecutionSessionTest(unittest.TestCase):
+    def test_tras_delays_earliest_precharge(self):
+        result = make_dram(tras=34).new_execution_session(
+            placement_policy="uniform", replication_factor=1
+        ).schedule_records([record("read", 0, 3 * 256)], op_index=0)
+
+        self.assertEqual(result.read.row_conflicts, 2)
+        self.assertEqual(result.read.stall_causing_row_conflicts, 2)
+        # ACT@0, PRE@34, ACT@48, PRE@82, ACT@96, data-ready@124,
+        # followed by 24 transfer cycles.
+        self.assertEqual(result.read.cycles, 148)
+        self.assertEqual(result.read.as_dict()[
+            "stall_causing_row_conflict_ratio"
+        ], 1.0)
+
+    def test_ready_alternative_bank_prevents_conflict_stall_attribution(self):
+        from tsim_components.dram_scheduler import DRAMRowRun
+
+        session = make_dram(banks=2, channels=1).new_execution_session(
+            placement_policy="uniform", replication_factor=1
+        )
+        session.policy = "fcfs"
+        session._open_rows[0] = 0
+        runs = [
+            DRAMRowRun(0, 0, 0, 1, 1, 128),
+            DRAMRowRun(1, 1, 0, 0, 1, 128),
+        ]
+        result = session._schedule_stage(runs, [{}, {}])
+
+        self.assertEqual(result.row_conflicts, 1)
+        self.assertEqual(result.stall_causing_row_conflicts, 0)
+
     def test_one_event_stream_provides_timing_and_row_counts(self):
         session = make_dram().new_execution_session(
             placement_policy="uniform", replication_factor=1

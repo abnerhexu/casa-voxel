@@ -56,6 +56,7 @@ class DRAMStageStats:
     row_hits: int = 0
     row_misses: int = 0
     row_conflicts: int = 0
+    stall_causing_row_conflicts: int = 0
     noc_byte_hops: float = 0.0
     noc_max_link_bytes: float = 0.0
     noc_max_hops: int = 0
@@ -72,6 +73,13 @@ class DRAMStageStats:
             "row_hits": int(self.row_hits),
             "row_misses": int(self.row_misses),
             "row_conflicts": int(self.row_conflicts),
+            "stall_causing_row_conflicts": int(
+                self.stall_causing_row_conflicts
+            ),
+            "stall_causing_row_conflict_ratio": (
+                float(self.stall_causing_row_conflicts) / self.row_conflicts
+                if self.row_conflicts else 0.0
+            ),
             "noc_byte_hops": float(self.noc_byte_hops),
             "noc_max_link_bytes": float(self.noc_max_link_bytes),
             "noc_max_hops": int(self.noc_max_hops),
@@ -326,8 +334,10 @@ class DRAMExecutionSession:
     Open-row state persists between fused operators.  Each read or write
     stage starts a fresh relative timing window because the outer TSim
     scheduler assigns its absolute start time. The default bounded policy
-    selects earliest-ready, using a row hit only to break ties. No tRAS
-    constraint is modelled. Optional controls retain the same stage boundary.
+    selects earliest-ready, using a row hit only to break ties. When DRAM.tRAS
+    is nonzero, every within-stage PRE obeys PRE >= ACT+tRAS. An inherited
+    open row is treated as tRAS-mature because absolute inter-stage time is
+    unavailable. Optional controls retain the same stage boundary.
     """
 
     def __init__(
@@ -605,7 +615,8 @@ class DRAMExecutionSession:
         # get_dram_time also emits preliminary analytical timing/conflicts.
         # Those are outputs of hardware, not part of the fixed access demand.
         outputs = {"cycles_per_core", "scheduled_cycles", "row_conflicts_per_core",
-                   "total_row_conflicts", "row_hits", "row_misses", "source"}
+                   "total_row_conflicts", "stall_causing_row_conflicts",
+                   "row_hits", "row_misses", "source"}
         return {k: v for k, v in record.items() if k not in outputs}
 
     @classmethod
@@ -644,6 +655,85 @@ class DRAMExecutionSession:
         channel_bytes = [0] * len(channel_free)
         bank_bytes = [0] * len(bank_free)
         bank_busy_integral = 0
+        record_stall_conflicts: Dict[int, int] = {}
+
+        # tRAS timestamps are local to this stage.  Rows left open by an
+        # earlier stage/operator are conservatively treated as already old
+        # enough to precharge because the outer TSim timeline is not passed
+        # into this relative stage scheduler.
+        activated_at: List[int | None] = [None] * len(bank_free)
+
+        def row_timing(candidate_run: DRAMRowRun):
+            """Return compact sequential row timing for one bank run.
+
+            Each ACT records its issue time.  A later PRE is delayed until
+            ACT+tRAS, then pays tRP before the next ACT.  With tRAS=0 this is
+            algebraically identical to the legacy CL/tRCD/tRP row-run cost.
+            """
+            bank = candidate_run.bank_id
+            cursor = int(bank_free[bank])
+            open_row = self._open_rows[bank]
+            first_hit = open_row == candidate_run.row_start
+            first_miss = open_row < 0
+            hits = 1 if first_hit else 0
+            misses = 1 if first_miss else 0
+            conflicts = (
+                (0 if first_hit or first_miss else 1)
+                + max(0, candidate_run.row_count - 1)
+            )
+            conflict_delay = 0
+            active = activated_at[bank]
+
+            if first_hit:
+                cursor += int(self.dram.CL)
+            elif first_miss:
+                active = cursor
+                cursor += int(self.dram.tRCD) + int(self.dram.CL)
+            else:
+                precharge = cursor
+                if active is not None:
+                    precharge = max(
+                        precharge, active + int(getattr(self.dram, "tRAS", 0))
+                    )
+                conflict_delay += (
+                    precharge - cursor + int(self.dram.tRP) + int(self.dram.tRCD)
+                )
+                active = precharge + int(self.dram.tRP)
+                cursor = active + int(self.dram.tRCD) + int(self.dram.CL)
+
+            remaining = max(0, candidate_run.row_count - 1)
+            # Rows in a run are consecutive and share identical timing after
+            # the first ACT, so apply the recurrence in closed form.  This is
+            # what keeps multi-GiB tensors O(records*banks), not O(rows).
+            if remaining and active is None:
+                conflict_delay += int(self.dram.tRP) + int(self.dram.tRCD)
+                active = cursor + int(self.dram.tRP)
+                cursor = active + int(self.dram.tRCD) + int(self.dram.CL)
+                remaining -= 1
+            if remaining:
+                active_to_data = int(self.dram.tRCD) + int(self.dram.CL)
+                tras_wait = max(
+                    0,
+                    int(getattr(self.dram, "tRAS", 0)) - active_to_data,
+                )
+                act_step = max(
+                    active_to_data,
+                    int(getattr(self.dram, "tRAS", 0)),
+                ) + int(self.dram.tRP)
+                conflict_delay += remaining * (
+                    tras_wait + int(self.dram.tRP) + int(self.dram.tRCD)
+                )
+                active += remaining * act_step
+                cursor = active + active_to_data
+            return {
+                "row_ready": cursor,
+                "no_conflict_row_ready": cursor - conflict_delay,
+                "final_activation": active,
+                "hits": hits,
+                "misses": misses,
+                "conflicts": conflicts,
+                "conflict_delay": conflict_delay,
+            }
 
         while pending:
             # Bounded FR-FCFS approximation.  First choose the request that
@@ -654,25 +744,18 @@ class DRAMExecutionSession:
             # traces.
             def candidate_key(candidate: int) -> Tuple[int, int, int]:
                 candidate_run = self._service_chunk(pending[candidate])[0]
-                candidate_open = self._open_rows[candidate_run.bank_id]
-                candidate_hit = candidate_open == candidate_run.row_start
-                candidate_miss = candidate_open < 0
-                candidate_conflicts = (
-                    (0 if candidate_hit or candidate_miss else 1)
-                    + max(0, candidate_run.row_count - 1)
-                )
-                candidate_row_cycles = (
-                    candidate_run.row_count * int(self.dram.CL)
-                    + (1 if candidate_miss else 0) * int(self.dram.tRCD)
-                    + candidate_conflicts
-                    * (int(self.dram.tRP) + int(self.dram.tRCD))
-                )
+                timing = row_timing(candidate_run)
+                candidate_hit = bool(timing["hits"])
+                candidate_row_ready = int(timing["row_ready"])
                 if self.counterfactual == "ideal_row_switch":
-                    candidate_row_cycles = candidate_run.row_count * int(self.dram.CL)
+                    candidate_row_ready = (
+                        bank_free[candidate_run.bank_id]
+                        + candidate_run.row_count * int(self.dram.CL)
+                    )
                 elif self.counterfactual in ("ideal_dram", "ideal_memory"):
-                    candidate_row_cycles = 0
+                    candidate_row_ready = bank_free[candidate_run.bank_id]
                 ready = max(
-                    bank_free[candidate_run.bank_id] + candidate_row_cycles,
+                    candidate_row_ready,
                     channel_free[candidate_run.channel_id],
                 )
                 return ready, 0 if candidate_hit else 1, candidate
@@ -699,6 +782,11 @@ class DRAMExecutionSession:
                 choice = min(eligible, key=candidate_key)
             input_index = input_indices[choice]
             run, remainder = self._service_chunk(pending[choice])
+            visible_alternatives = [
+                self._service_chunk(pending[index])[0]
+                for index in eligible
+                if index != choice
+            ]
             bypass_count = bypasses[choice]
             for index in eligible:
                 bypasses[index] += 1
@@ -709,21 +797,11 @@ class DRAMExecutionSession:
             else:
                 pending[choice] = remainder
                 bypasses[choice] = 0
-            open_row = self._open_rows[run.bank_id]
-            first_hit = open_row == run.row_start
-            first_miss = open_row < 0
-            hits = 1 if first_hit else 0
-            misses = 1 if first_miss else 0
-            conflicts = (0 if first_hit or first_miss else 1) + max(0, run.row_count - 1)
-
-            # One CL per touched row.  Closed-row accesses pay ACT/tRCD;
-            # replacements pay PRE+tRCD.  tRAS is intentionally absent.
-            row_cycles = (
-                run.row_count * int(self.dram.CL)
-                + misses * int(self.dram.tRCD)
-                + conflicts * (int(self.dram.tRP) + int(self.dram.tRCD))
-            )
-            row_ready = bank_free[run.bank_id] + row_cycles
+            timing = row_timing(run)
+            hits = int(timing["hits"])
+            misses = int(timing["misses"])
+            conflicts = int(timing["conflicts"])
+            row_ready = int(timing["row_ready"])
             transfer_cycles = max(
                 1, int(ceil(run.num_bytes / self._chip_channel_bytes_per_cycle))
             )
@@ -732,6 +810,36 @@ class DRAMExecutionSession:
             elif self.counterfactual in ("ideal_dram", "ideal_memory"):
                 row_ready = bank_free[run.bank_id]
                 transfer_cycles = 0
+
+            # Attribute conflicts to a TSV-bus stall only when their timing
+            # penalty is exposed after the channel becomes free and no other
+            # visible request on another bank of this channel can start data
+            # transfer sooner.  The compact row-run model counts every
+            # sequential conflict in the selected run under that condition.
+            stall_conflicts = 0
+            if (
+                conflicts > 0
+                and self.counterfactual == "none"
+                and row_ready > channel_free[run.channel_id]
+                and row_ready > max(
+                    channel_free[run.channel_id],
+                    int(timing["no_conflict_row_ready"]),
+                )
+            ):
+                alternative_ready = []
+                for alt_run in visible_alternatives:
+                    if (
+                        alt_run.channel_id == run.channel_id
+                        and alt_run.bank_id != run.bank_id
+                    ):
+                        alternative_ready.append(
+                            max(
+                                int(row_timing(alt_run)["row_ready"]),
+                                channel_free[alt_run.channel_id],
+                            )
+                        )
+                if not alternative_ready or min(alternative_ready) >= row_ready:
+                    stall_conflicts = conflicts
             transfer_start = max(row_ready, channel_free[run.channel_id])
             finish = transfer_start + transfer_cycles
             if self.instrument:
@@ -750,15 +858,19 @@ class DRAMExecutionSession:
                                "release": 0, "bank_start": bank_free[run.bank_id],
                                "row_ready": row_ready, "transfer_start": transfer_start,
                                "finish": finish, "hits": hits, "misses": misses,
-                               "conflicts": conflicts})
+                               "conflicts": conflicts,
+                               "stall_causing_conflicts": stall_conflicts,
+                               "conflict_delay_cycles": int(timing["conflict_delay"])})
             decisions += 1
             bank_free[run.bank_id] = finish
             channel_free[run.channel_id] = finish
             self._open_rows[run.bank_id] = run.row_start + run.row_count - 1
+            activated_at[run.bank_id] = timing["final_activation"]
 
             stats.row_hits += hits
             stats.row_misses += misses
             stats.row_conflicts += conflicts
+            stats.stall_causing_row_conflicts += stall_conflicts
             record_start[run.record_index] = min(
                 record_start.get(run.record_index, transfer_start), transfer_start
             )
@@ -769,6 +881,10 @@ class DRAMExecutionSession:
             counts[0] += hits
             counts[1] += misses
             counts[2] += conflicts
+            record_stall_conflicts[run.record_index] = (
+                record_stall_conflicts.get(run.record_index, 0)
+                + stall_conflicts
+            )
 
         stats.cycles = max(channel_free, default=0)
         if self.instrument:
@@ -797,6 +913,9 @@ class DRAMExecutionSession:
             record["row_hits"] = int(counts[0])
             record["row_misses"] = int(counts[1])
             record["total_row_conflicts"] = int(counts[2])
+            record["stall_causing_row_conflicts"] = int(
+                record_stall_conflicts.get(record_index, 0)
+            )
             record["scheduled_cycles"] = int(
                 record_finish[record_index] - record_start[record_index]
             )

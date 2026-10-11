@@ -278,12 +278,14 @@ class SRAM:
 class DRAM:
     """Cycle-level DRAM access-cost model with row-open / row-conflict timing.
 
-    The model accounts for three key DRAM timing parameters:
+    The model accounts for four key DRAM timing parameters:
 
     * **CL** (CAS Latency) -- column-access strobe to data.
     * **tRCD** (RAS-to-CAS Delay) -- row activation to column command.
     * **tRP** (Row Precharge) -- minimum time to close a row before
       opening a new one.
+    * **tRAS** (Row Active Time) -- optional minimum ACT-to-PRE delay used
+      by the placement-aware execution scheduler.
 
     A *row reopen* costs ``CL + tRCD + tRP`` cycles.  The number of
     reopens is determined by both the access granularity (how data is
@@ -292,7 +294,7 @@ class DRAM:
 
     Parameters
     ----------
-    CL, tRCD, tRP : int
+    CL, tRCD, tRP, tRAS : int
         DRAM timing parameters in core clock cycles.
     bytes_per_row : int
         Size of one DRAM row (row buffer) in bytes.
@@ -333,10 +335,17 @@ class DRAM:
                  lock_cores_per_bank: float = 0,
                  soft_cores_per_bank: bool = True,
                  capacity_bytes: Optional[int] = None,
+                 tRAS: int = 0,
                 ) -> None:
         self.CL: int = CL
         self.tRCD: int = tRCD
         self.tRP: int = tRP
+        # Minimum ACT-to-PRE delay.  A zero default preserves legacy
+        # configurations which did not model tRAS; explicit configurations
+        # can opt into the physical earliest-precharge constraint.
+        self.tRAS: int = int(tRAS)
+        if self.tRAS < 0:
+            raise ValueError("tRAS must be nonnegative")
         # Full row-reopen penalty: activate + column-access + precharge.
         self.reopen: int = CL + tRCD + tRP
         # ``num_banks_per_channel`` is a legacy constructor argument. When it
@@ -465,6 +474,7 @@ class DRAM:
             int(self.CL),
             int(self.tRCD),
             int(self.tRP),
+            int(self.tRAS),
             int(self.bytes_per_row),
             int(self.num_banks),
             int(self.transaction_bytes),

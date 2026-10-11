@@ -193,6 +193,7 @@ def get_hw_modules( hw_config, num_cores,
     dram = DRAM(CL=dram_info["CL"],
                 tRCD=dram_info["tRCD"],
                 tRP=dram_info["tRP"],
+                tRAS=int(dram_info.get("tRAS", 0)),
                 bytes_per_row=row_bytes_per_core,
                 bytes_per_cycle=per_cycle_bytes_per_core,
                 num_cores=num_cores,
@@ -203,8 +204,8 @@ def get_hw_modules( hw_config, num_cores,
                 **geometry_kwargs,
                 **dram_kwargs)
     # Metadata used by the bounded scheduler and machine-readable experiment
-    # records. tRAS is recorded for architectural completeness but remains
-    # intentionally absent from the timing model.
+    # records.  ``tRAS`` above is enforced; ``tRAS_recorded`` retains the
+    # requested/provenance value for older result readers.
     dram.tRAS_recorded = int(dram_info.get("tRAS_recorded", dram_info.get("tRAS", 0)))
     dram.frfcfs_window = int(dram_info.get("frfcfs_window", 32))
     dram.tsv_buses_per_channel = int(dram_info.get("tsv_buses_per_channel", 1))
