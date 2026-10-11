@@ -48,6 +48,122 @@ def summary(spec, comp):
                 cells=math.prod(cell_counts))
 
 
+def movement_profile(spec, comp, hw):
+    """Return per-core backing-store and remote-SRAM movement for one tiling.
+
+    This is the byte-accounting counterpart of :func:`export_program`.  It
+    uses the same canonical dense streams, balanced contiguous core slices,
+    ring sharing, and output-reduction policy, but avoids constructing a full
+    graph when an experiment only needs movement and capacity information.
+
+    ``vertical_bytes_by_core`` counts required backing-store reads and writes
+    assigned to each core.  ``remote_sram_bytes_by_core`` counts payload bytes
+    received from another core.  The latter deliberately excludes hop
+    weighting so the two arrays have the same unit and may be added.  The
+    separate ``noc_byte_hops`` field follows dimension-ordered XY routes.
+
+    A shared-SRAM counterfactual uses the same vertical traffic and pooled
+    capacity, while treating the remote flows as internal uniform SRAM
+    accesses.  It must not invent a second set of tilings or backing-store
+    requests.
+    """
+    from .system_model import route
+
+    n = int(hw.cores)
+    if n <= 0:
+        raise ValueError("hardware must contain at least one core")
+    cost = summary(spec, comp)
+    vertical = [0] * n
+    remote = [0] * n
+    byte_hops = 0
+    flow_count = 0
+
+    def add_flow(src, dst, num_bytes):
+        nonlocal byte_hops, flow_count
+        num_bytes = int(num_bytes)
+        if num_bytes <= 0 or src == dst:
+            return
+        remote[int(dst)] += num_bytes
+        byte_hops += num_bytes * len(route(int(src), int(dst), hw))
+        flow_count += 1
+
+    for variable, tensor in enumerate(spec["tensors"]):
+        del tensor  # Tensor identity does not change the stream volume.
+        size = int(spec["element_bytes"] * math.prod(
+            spec["dims"][axis]
+            for axis in spec["variables"][variable]
+            if axis is not None
+        ))
+        elements = size // int(spec["element_bytes"])
+        spatial_copies = math.prod(
+            min(spatial, math.ceil(dim / math.ceil(dim / spatial)))
+            for axis, (dim, spatial) in enumerate(
+                zip(spec["dims"], spec["spatial"])
+            )
+            if axis not in spec["variables"][variable]
+        )
+        sharing = (
+            math.gcd(cost["passes"][variable], math.gcd(spatial_copies, n))
+            if variable else 1
+        )
+        for core in range(n):
+            left = elements * core // n * int(spec["element_bytes"])
+            right = elements * (core + 1) // n * int(spec["element_bytes"])
+            segment_bytes = right - left
+            if segment_bytes <= 0:
+                continue
+            if variable == 0:
+                # The final value of every output element is materialized once.
+                vertical[core] += segment_bytes
+                copies = min(spatial_copies, n)
+                if copies > 1 and n > 1:
+                    add_flow(
+                        core,
+                        (core + 1) % n,
+                        segment_bytes * (copies - 1),
+                    )
+            else:
+                passes = cost["passes"][variable] // sharing
+                vertical[core] += segment_bytes * passes
+                if sharing > 1:
+                    group_start = core // sharing * sharing
+                    destination = group_start + (
+                        (core + 1 - group_start) % sharing
+                    )
+                    add_flow(
+                        core,
+                        destination,
+                        segment_bytes * (sharing - 1) * passes,
+                    )
+
+    vertical_total = sum(vertical)
+    remote_total = sum(remote)
+    if vertical_total < 0 or remote_total < 0:
+        raise AssertionError("movement counters must be nonnegative")
+    return {
+        "vertical_bytes_by_core": vertical,
+        "remote_sram_bytes_by_core": remote,
+        "private_bytes_by_core": [
+            vertical[index] + remote[index] for index in range(n)
+        ],
+        "vertical_bytes": vertical_total,
+        "remote_sram_bytes": remote_total,
+        "private_bytes": vertical_total + remote_total,
+        "noc_byte_hops": int(byte_hops),
+        "noc_flow_count": int(flow_count),
+        "private_peak_sram_bytes_by_core": [
+            int(cost["scratch_bytes_per_core"])
+        ] * n,
+        "shared_peak_sram_bytes": int(cost["scratch_bytes_per_core"]) * n,
+        "cost_summary": cost,
+        "semantics": (
+            "VOXEL aggregate_stream_v1 canonical dense streams; vertical "
+            "reads+writes plus incoming remote-SRAM payload; XY byte-hops "
+            "reported separately"
+        ),
+    }
+
+
 def export_program(specs, comp, hw, *, paradigm, instances=1, stages=2, **unused):
     if instances < 1 or stages < 1 or hw.cores % stages:
         raise ValueError("invalid instance/stage count")
