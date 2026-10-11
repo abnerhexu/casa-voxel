@@ -48,13 +48,13 @@ class FakeLog:
         }
 
 
-def make_dram():
+def make_dram(capacity_bytes=192 * 1024**3):
     return DRAM(
         CL=14, tRCD=14, tRP=14, tRAS=34,
         bytes_per_row=8192, bytes_per_cycle=64,
         num_cores=32, num_layers=8, banks_per_layer=16,
         num_channels=16, transaction_bytes=128,
-        capacity_bytes=192 * 1024**3,
+        capacity_bytes=capacity_bytes,
         soft_cores_per_bank=False, lock_cores_per_bank=1,
     )
 
@@ -99,6 +99,21 @@ class ReuseFrontierTest(unittest.TestCase):
                 [FakeLog()], make_dram(), make_noc(),
                 [ReuseChoice(128, 1, 0, 0)],
             )
+
+    def test_serial_operators_reuse_reroute_workspace_capacity(self):
+        # Base input/output allocations consume 8 KiB. Each operator moves
+        # another 4 KiB through the input-replica workspace. The two serial
+        # operators must share that workspace (12 KiB peak), rather than
+        # incorrectly requiring 16 KiB of simultaneous DRAM capacity.
+        choices = [
+            ReuseChoice(4096, 4096, 0, 0),
+            ReuseChoice(4096, 4096, 0, 0),
+        ]
+        result = replay_reuse_plan(
+            [FakeLog(), FakeLog()], make_dram(12 * 1024), make_noc(), choices
+        )
+        self.assertEqual(result["additional_tsv_bytes"], 8192)
+        self.assertEqual(result["removed_noc_bytes"], 8192)
 
 
 if __name__ == "__main__":

@@ -85,7 +85,14 @@ def _extra_record(
 ) -> dict:
     if total_bytes <= 0:
         raise ValueError("extra reuse record must carry positive traffic")
-    tensor_id = f"reuse/{role}/op{op_index:04d}"
+    # Operators execute serially in this replay, so their reroute buffers do
+    # not have overlapping lifetimes.  Keep one physical workspace per role
+    # and let the global allocator size it to the largest operator record.
+    # The traffic remains operator-specific through ``total_bytes`` and the
+    # ordered schedule below.  Giving every operator a distinct allocation
+    # would incorrectly turn cumulative motif traffic into simultaneously
+    # resident DRAM capacity.
+    tensor_id = f"reuse/{role}/workspace"
     return {
         "version": 1,
         "source": "tsim_reuse_frontier",
@@ -108,6 +115,7 @@ def _extra_record(
         "scheduled_cycles": 0,
         "ignored": False,
         "reuse_materialization": True,
+        "workspace_reuse": "operator_serial",
     }
 
 
@@ -299,7 +307,7 @@ def replay_reuse_plan(
         value.reduction_reroute_bytes for value in normalized
     )
     return {
-        "model": "native_tsim_mixed_reuse_replay_v1",
+        "model": "native_tsim_mixed_reuse_replay_v2",
         "cycles": int(cycles),
         "dram_read_bytes": int(read_bytes),
         "dram_write_bytes": int(write_bytes),
