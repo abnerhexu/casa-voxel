@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from tsim_components.noc import NoC, Topo
 from tsim_components.mem import DRAM
-from tsim_simple import run_tsim
+from tsim_simple import _split_fused_ops_by_hot_capacity, run_tsim
 from web_profiler.server.parsers import parse_operators_text, parse_summary_text
 
 
@@ -15,6 +15,13 @@ class NoCTrafficHopsTest(unittest.TestCase):
             topology=Topo.MESH,
             nodes=list(range(4)),
         )
+
+    def test_fusion_plan_is_split_by_aggregate_hot_footprint(self):
+        ops = [object(), object(), object(), object()]
+        groups = _split_fused_ops_by_hot_capacity(
+            [ops[:3], ops[3:]], [3, 4, 5, 2], 7
+        )
+        self.assertEqual(groups, [ops[:2], ops[2:3], ops[3:]])
 
     def test_byte_hops_match_default_mapping_math(self):
         tensor_sizes = [100, 200]
@@ -127,6 +134,10 @@ class NoCTrafficHopsTest(unittest.TestCase):
 
     def test_run_tsim_exposes_aggregate_and_per_operator_metrics(self):
         class FakeExpr:
+            config_dict = {
+                ((2, 2), ((1, 1), (1, 1))): (1024, 0, 0, 0),
+            }
+
             def get_sub_op_var_sizes(self, temporal, spatial, return_size=True):
                 return [100, 200]
 
@@ -145,11 +156,19 @@ class NoCTrafficHopsTest(unittest.TestCase):
         class FakeProgram:
             ops = [op]
             tot_num_cores = 4
+            expected_fused_ops = None
 
             def get_best_config_by_max_mem_size(self, *args):
                 return [2, 2], [[1, 1], [1, 1]]
 
+            @staticmethod
+            def _freeze_tiling_value(value):
+                if isinstance(value, list):
+                    return tuple(FakeProgram._freeze_tiling_value(v) for v in value)
+                return value
+
             def get_fused_exec_time(self, **kwargs):
+                self.assert_fusion_forwarded(kwargs["fused_ops"])
                 stats = {
                     "exec_time": 100,
                     "exec_energy": 0,
@@ -168,6 +187,10 @@ class NoCTrafficHopsTest(unittest.TestCase):
                 }
                 return stats, [op_log]
 
+            def assert_fusion_forwarded(self, fused_ops):
+                if fused_ops is not self.expected_fused_ops:
+                    raise AssertionError("run_tsim discarded the fusion plan")
+
             def get_fused_dram_bytes_only(self, **kwargs):
                 return [(0, 0)]
 
@@ -176,10 +199,15 @@ class NoCTrafficHopsTest(unittest.TestCase):
         class FakeComputeOp:
             comp = compute
 
-            def fuse_ops(self, ops, *args, **kwargs):
-                return [[item] for item in ops]
+            def __init__(self):
+                self.fused_ops = [[op]]
 
-            def compute_costs(self, *args, **kwargs):
+            def fuse_ops(self, ops, *args, **kwargs):
+                return self.fused_ops
+
+            def compute_costs(self, fused_ops, *args, **kwargs):
+                if fused_ops is not self.fused_ops:
+                    raise AssertionError("compute_costs did not receive fusion plan")
                 return [(1, 1, 0, 0, 0)]
 
         dram = DRAM(
@@ -190,14 +218,17 @@ class NoCTrafficHopsTest(unittest.TestCase):
             bytes_per_cycle=16,
             num_cores=4,
         )
+        compute_op = FakeComputeOp()
+        program = FakeProgram()
+        program.expected_fused_ops = compute_op.fused_ops
         with patch("tsim_simple.get_overlap", return_value=[]):
             _, stats, logs, _ = run_tsim(
-                prog=FakeProgram(),
+                prog=program,
                 total_sram_byte_per_core=4096,
                 exe_space=2048,
                 dram=dram,
                 noc=self.noc,
-                comp_op=FakeComputeOp(),
+                comp_op=compute_op,
                 core_group_size=1,
                 dram_bandwidth_GBps=128,
                 npu_freq_MHz=1500,

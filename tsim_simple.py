@@ -436,6 +436,43 @@ def run_tsim_helper(params):
                     seq_noc=seq_noc,
                     aggregate_scale=aggregate_scale)
 
+def _split_fused_ops_by_hot_capacity(
+    fused_ops: Sequence[Sequence[TensorOperator]],
+    hot_bytes: Sequence[int],
+    execution_sram_bytes: int,
+) -> List[List[TensorOperator]]:
+    """Split a fusion plan until every group's aggregate hot data fits SRAM."""
+    if sum(len(group) for group in fused_ops) != len(hot_bytes):
+        raise ValueError("fusion plan and hot-footprint list have different sizes")
+    result: List[List[TensorOperator]] = []
+    cursor = 0
+    for group in fused_ops:
+        current: List[TensorOperator] = []
+        current_bytes = 0
+        for op in group:
+            op_bytes = int(hot_bytes[cursor])
+            cursor += 1
+            if op_bytes > execution_sram_bytes:
+                raise ValueError(
+                    f"operator hot footprint {op_bytes} exceeds execution SRAM "
+                    f"{execution_sram_bytes}"
+                )
+            if current and current_bytes + op_bytes > execution_sram_bytes:
+                result.append(current)
+                current = []
+                current_bytes = 0
+            current.append(op)
+            current_bytes += op_bytes
+        if current:
+            result.append(current)
+    if (
+        len(result) == len(fused_ops)
+        and all(len(left) == len(right) for left, right in zip(result, fused_ops))
+    ):
+        return fused_ops  # Preserve the compiler plan object when no split occurred.
+    return result
+
+
 def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:DRAM, noc:NoC, comp_op:Compute_OP,
              core_group_size:int, dram_bandwidth_GBps:int, npu_freq_MHz:int, tot_layers:int, sim_layers:int,
              dram_name:str = "unspec_mem", spmd_compiler:bool = False, seq_noc:bool = False,
@@ -499,6 +536,7 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
     all_tensor_shapes = []
     all_temporal_partitions = []
     all_partitions = []
+    all_hot_bytes = []
     all_noc_cycles = []
     all_noc_traffic_hops = []
     print("Gathering op data...")
@@ -528,6 +566,11 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
                     f"bytes, exceeding exe_space={exe_space}"
                 )
             spatial, temporal = frozen_config
+        final_config = (
+            prog._freeze_tiling_value(spatial),
+            prog._freeze_tiling_value(temporal),
+        )
+        all_hot_bytes.append(int(op.expr.config_dict[final_config][0]))
         tensor_shapes = op.expr.get_sub_op_var_sizes(temporal, spatial, False)
         all_temporal_partitions.append(temporal)
         all_partitions.append((temporal, spatial))
@@ -554,14 +597,18 @@ def run_tsim(prog:DNNProgram, total_sram_byte_per_core:int, exe_space:int, dram:
     print("Fusing ops...")
     # Fuse operators using the balanced heuristic to amortize DRAM traffic.
     fused_ops = comp_op.fuse_ops(unfused_ops, exe_space, all_tensor_shapes, method="balanced")
-    comp_op_cycles = comp_op.compute_costs([[op] for op in unfused_ops], all_partitions)
+    fused_ops = _split_fused_ops_by_hot_capacity(
+        fused_ops, all_hot_bytes, exe_space
+    )
+    comp_op_cycles = comp_op.compute_costs(fused_ops, all_partitions)
     print("Fusing ops took", time.time() - fuse_start, "seconds")
     exec_stat_start = time.time()
     print("Computing execution statistics...")
-    # Compute overall execution using UNFUSED ops for memory alloc etc,
-    # but fused ops for read/write traffic estimation.
+    # Preserve the SRAM-dependent fusion plan through traffic, allocation,
+    # compute, and timing.  Replacing it with singleton operators here erases
+    # the very fusion and preload effects that the SRAM sweep is measuring.
     use_largest_cold = True
-    stats, fused_op_logs = prog.get_fused_exec_time(fused_ops=[[op] for op in unfused_ops],
+    stats, fused_op_logs = prog.get_fused_exec_time(fused_ops=fused_ops,
                                                         partitions=all_partitions,
                                                         comp=comp_op.comp,
                                                         dram=dram,
