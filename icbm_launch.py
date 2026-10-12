@@ -209,6 +209,13 @@ def get_hw_modules( hw_config, num_cores,
     dram.tRAS_recorded = int(dram_info.get("tRAS_recorded", dram_info.get("tRAS", 0)))
     dram.frfcfs_window = int(dram_info.get("frfcfs_window", 32))
     dram.tsv_buses_per_channel = int(dram_info.get("tsv_buses_per_channel", 1))
+    # Legacy configurations already fold every physical TSV bus into the
+    # advertised channel bandwidth.  Keep that interpretation by default and
+    # require an explicit opt-in when ``tsv_buses_per_channel`` is meant to
+    # scale service rather than serve as metadata only.
+    dram.tsv_bus_bandwidth_scales_service = bool(
+        dram_info.get("tsv_bus_bandwidth_scales_service", False)
+    )
     dram.tsv_bus_bandwidth_GBps = float(
         dram_info.get(
             "tsv_bus_bandwidth_GBps",

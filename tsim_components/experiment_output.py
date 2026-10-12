@@ -305,6 +305,11 @@ def build_experiment_record(
                 "tsv_buses_per_channel": int(
                     getattr(dram, "tsv_buses_per_channel", 1)
                 ),
+                "tsv_bus_bandwidth_scales_service": bool(
+                    getattr(
+                        dram, "tsv_bus_bandwidth_scales_service", False
+                    )
+                ),
                 "tsv_bus_bandwidth_gb_per_s": float(
                     getattr(
                         dram,

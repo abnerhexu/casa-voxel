@@ -35,6 +35,20 @@ def record(stage, tensor_index, size):
 
 
 class DRAMExecutionSessionTest(unittest.TestCase):
+    def test_tsv_bus_count_scales_service_only_when_explicitly_enabled(self):
+        dram = make_dram(bytepc=32)
+        dram.tsv_buses_per_channel = 4
+        legacy = dram.new_execution_session(
+            placement_policy="uniform", replication_factor=1
+        )
+        self.assertEqual(legacy._chip_channel_bytes_per_cycle, 32)
+
+        dram.tsv_bus_bandwidth_scales_service = True
+        scaled = dram.new_execution_session(
+            placement_policy="uniform", replication_factor=1
+        )
+        self.assertEqual(scaled._chip_channel_bytes_per_cycle, 128)
+
     def test_chip_wide_traffic_is_sharded_across_every_executing_core(self):
         weights = chip_sharded_requester_weights(1025, 4)
 

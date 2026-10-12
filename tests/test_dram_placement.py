@@ -85,17 +85,27 @@ class DRAMPlacementTest(unittest.TestCase):
         )
         self.assertEqual(channel_injection_nodes(3, 8), (1, 4, 6))
 
-    def test_more_channels_than_cores_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "cannot bind 9 DRAM channels"):
-            balanced_channel_core_groups(9, 8)
-        with self.assertRaisesRegex(ValueError, "cannot bind 9 DRAM channels"):
-            build_placement_plan(
-                with_requesters(make_records()),
-                total_banks=16,
-                num_channels=9,
-                policy="noc_aware",
-                noc=make_mesh(8),
-            )
+    def test_more_channels_than_cores_co_locates_channel_endpoints(self):
+        groups = balanced_channel_core_groups(9, 8)
+        self.assertEqual(len(groups), 9)
+        self.assertTrue(all(len(group) == 1 for group in groups))
+        self.assertTrue(all(0 <= group[0] < 8 for group in groups))
+        plan = build_placement_plan(
+            with_requesters(make_records()),
+            total_banks=18,
+            num_channels=9,
+            policy="noc_aware",
+            noc=make_mesh(8),
+        )
+        self.assertEqual(len(plan), len(make_records()))
+
+    def test_block_identity_allows_page_granular_placement(self):
+        first = {"tensor_id": 42, "block_id": 0}
+        second = {"tensor_id": 42, "block_id": 1}
+        legacy = {"tensor_id": 42}
+
+        self.assertNotEqual(record_signature(first), record_signature(second))
+        self.assertNotEqual(record_signature(first), record_signature(legacy))
 
     def test_noc_aware_prefers_nearby_channel_injection_nodes(self):
         records = [

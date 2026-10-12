@@ -26,6 +26,7 @@ class Hardware:
     bank_capacity: int = 192 * 1024**3 // 256
     sram_bytes: int = 2 * 1024**2
     channel_bytepc: float = 16.0
+    tsv_buses_per_channel: int = 1
     noc_bytepc: float = 16.0
     cl: int = 14
     rcd: int = 14
@@ -46,8 +47,8 @@ class Hardware:
                     "bank_capacity", "sram_bytes", "frequency_mhz", "dram_burst_bytes", "noc_packet_bytes"):
             if type(getattr(self, key)) is not int or getattr(self, key) <= 0:
                 raise ValueError(f"{key} must be a positive integer")
-        if self.cores % self.mesh_width or self.channels > self.cores:
-            raise ValueError("rectangular mesh and channels <= cores required")
+        if self.cores % self.mesh_width:
+            raise ValueError("rectangular mesh required")
         if self.dram_burst_bytes > self.row_bytes or self.row_bytes % self.dram_burst_bytes:
             raise ValueError("DRAM burst must divide the physical row")
         for key in ("channel_bytepc", "noc_bytepc"):
@@ -59,12 +60,27 @@ class Hardware:
         for key in ("dram_pj_byte", "conflict_pj", "noc_pj_byte_hop", "tsv_pj_byte"):
             if not math.isfinite(getattr(self, key)) or getattr(self, key) < 0:
                 raise ValueError(f"invalid {key}")
+        if type(self.tsv_buses_per_channel) is not int or self.tsv_buses_per_channel <= 0:
+            raise ValueError("tsv_buses_per_channel must be a positive integer")
         if not self.channel_nodes:
-            q, r = divmod(self.cores, self.channels)
-            groups = [q + (c < r) for c in range(self.channels)]
-            starts = [sum(groups[:c]) for c in range(self.channels)]
-            object.__setattr__(self, "channel_nodes", tuple(
-                s + (n - 1)//2 for s, n in zip(starts, groups)))
+            if self.channels <= self.cores:
+                q, r = divmod(self.cores, self.channels)
+                groups = [q + (c < r) for c in range(self.channels)]
+                starts = [sum(groups[:c]) for c in range(self.channels)]
+                nodes = tuple(
+                    start + (count - 1) // 2
+                    for start, count in zip(starts, groups)
+                )
+            else:
+                nodes = tuple(
+                    min(
+                        self.cores - 1,
+                        (channel * self.cores + self.channels // 2)
+                        // self.channels,
+                    )
+                    for channel in range(self.channels)
+                )
+            object.__setattr__(self, "channel_nodes", nodes)
         if not self.bank_channels:
             object.__setattr__(self, "bank_channels", tuple(b % self.channels for b in range(self.banks)))
         if (len(self.channel_nodes) != self.channels or
@@ -527,7 +543,10 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
                 row_cost = n*hw.cl+cold*hw.rcd+paid*(hw.rp+hw.rcd)
                 start = max(now, bank_end[bank])
                 bus_start, finish = reserve([f"channel:{t['channel']}"], start+row_cost,
-                                            math.ceil(t["bytes"]/hw.channel_bytepc), key)
+                                            math.ceil(
+                                                t["bytes"]
+                                                / (hw.channel_bytepc * hw.tsv_buses_per_channel)
+                                            ), key)
                 calendars[f"bank:{bank}"].reserve(start, finish-start, key)
                 bank_end[bank] = finish
                 open_row[bank], open_tensor[bank] = row+n-1, t["tensor"]

@@ -35,7 +35,12 @@ def record_signature(record: Mapping[str, object]) -> RecordSignature:
         # A physical tensor keeps one placement across reads, writes,
         # operators, and layers. String conversion also supports synthetic
         # IDs used by tests and imported traces.
-        return (str(tensor_id), 0, 0, "", "")
+        block_id = record.get("block_id")
+        physical_id = (
+            f"{tensor_id}#block={block_id}" if block_id is not None
+            else str(tensor_id)
+        )
+        return (physical_id, 0, 0, "", "")
     return (
         "",
         int(record.get("subop_index", 0) or 0),
@@ -83,9 +88,12 @@ def balanced_channel_core_groups(
     if num_channels <= 0 or num_cores <= 0:
         raise ValueError("num_channels and num_cores must be positive")
     if num_channels > num_cores:
-        raise ValueError(
-            f"cannot bind {num_channels} DRAM channels to only {num_cores} "
-            "NoC cores"
+        return tuple(
+            (min(
+                num_cores - 1,
+                (channel * num_cores + num_channels // 2) // num_channels,
+            ),)
+            for channel in range(num_channels)
         )
     quotient, remainder = divmod(num_cores, num_channels)
     groups = []
@@ -446,11 +454,6 @@ def noc_aware_placements(
     if len(channel_nodes) != num_channels:
         raise ValueError("channel_nodes must contain one NoC node per channel")
     num_cores = len(hop_matrix)
-    if num_channels > num_cores:
-        raise ValueError(
-            f"cannot bind {num_channels} DRAM channels to only {num_cores} "
-            "NoC cores"
-        )
     if any(len(row) != num_channels for row in hop_matrix):
         raise ValueError("hop_matrix must have shape [num_cores][num_channels]")
     if any(int(node) < 0 or int(node) >= num_cores for node in channel_nodes):

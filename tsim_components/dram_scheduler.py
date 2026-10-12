@@ -165,6 +165,7 @@ def _locality_matched_dram_flows(
     channel_nodes,
     channel_weights: Mapping[int, float],
     demand: Sequence[Tuple[int, float]],
+    explicit_flows=None,
 ) -> Tuple[Tuple[int, int, float, Tuple[int, ...]], ...]:
     """Match placed channel shards to requester shards by physical locality.
 
@@ -190,6 +191,38 @@ def _locality_matched_dram_flows(
     demand_total = sum(demands.values())
     if supply_total <= 0 or demand_total <= 0:
         return tuple()
+    if explicit_flows is not None:
+        flows = []
+        supplied: Dict[int, float] = {}
+        requested: Dict[int, float] = {}
+        for item in explicit_flows:
+            if len(item) != 3:
+                raise ValueError(
+                    "channel_requester_flows entries must be "
+                    "[channel, core, bytes]"
+                )
+            channel, core, amount = int(item[0]), int(item[1]), float(item[2])
+            if channel not in supplies or core not in demands or amount <= 0:
+                raise ValueError("explicit channel/requester flow is outside demand")
+            endpoint = int(channel_nodes[channel])
+            path = tuple(int(node) for node in noc.get_dimension_ordered_path(
+                endpoint, core
+            ))
+            flows.append((channel, core, amount, path))
+            supplied[channel] = supplied.get(channel, 0.0) + amount
+            requested[core] = requested.get(core, 0.0) + amount
+        tolerance = max(1e-6, supply_total * 1e-12)
+        if any(abs(supplied.get(channel, 0.0) - amount) > tolerance
+               for channel, amount in supplies.items()):
+            raise ValueError("explicit flows do not conserve per-channel supply")
+        normalized_demand = {
+            core: amount * supply_total / demand_total
+            for core, amount in demands.items()
+        }
+        if any(abs(requested.get(core, 0.0) - amount) > tolerance
+               for core, amount in normalized_demand.items()):
+            raise ValueError("explicit flows do not conserve requester demand")
+        return tuple(flows)
     # Imported traces may encode relative requester weights. Normalize them
     # to the exact scheduled byte supply before constructing physical flows.
     scale = supply_total / demand_total
@@ -289,7 +322,8 @@ def _attach_dram_noc_stats(
             continue
 
         flows = _locality_matched_dram_flows(
-            noc, channel_nodes, channel_weights, demand
+            noc, channel_nodes, channel_weights, demand,
+            explicit_flows=record.get("channel_requester_flows"),
         )
         link_index = {link: index for index, link in enumerate(directed_links)}
         record_link_loads = np.zeros(len(directed_links), dtype=np.float64)
@@ -342,6 +376,12 @@ def _attach_dram_noc_stats(
     stats.noc_max_link_bytes = float(np.max(stage_link_loads, initial=0.0))
     stats.noc_max_hops = int(stage_max_hops)
     stats.noc_flow_count = int(stage_flow_count)
+    stats.resource.setdefault("noc_directed_links", [
+        [int(source), int(destination)] for source, destination in directed_links
+    ])
+    stats.resource["noc_link_load_bytes"] = [
+        float(value) for value in stage_link_loads
+    ]
     if stats.noc_max_link_bytes > 0:
         stats.noc_cycles = (
             _noc_stage_startup_cycles(noc)
@@ -437,9 +477,17 @@ class DRAMExecutionSession:
 
     @property
     def _chip_channel_bytes_per_cycle(self) -> float:
+        buses = (
+            max(1, int(getattr(self.dram, "tsv_buses_per_channel", 1)))
+            if bool(getattr(
+                self.dram, "tsv_bus_bandwidth_scales_service", False
+            )) else 1
+        )
         return max(
             1e-12,
-            float(self.dram.channel_bytes_per_cycle) * self.replication_factor,
+            float(self.dram.channel_bytes_per_cycle)
+            * self.replication_factor
+            * buses,
         )
 
     def _row_runs(
@@ -684,8 +732,16 @@ class DRAMExecutionSession:
         if not runs:
             return stats
         if self.dram.use_sram:
+            buses = (
+                max(1, int(getattr(self.dram, "tsv_buses_per_channel", 1)))
+                if bool(getattr(
+                    self.dram, "tsv_bus_bandwidth_scales_service", False
+                )) else 1
+            )
             stats.cycles = int(ceil(stats.num_bytes / (
-                float(self.dram.total_bytes_per_cycle) * self.replication_factor
+                float(self.dram.total_bytes_per_cycle)
+                * self.replication_factor
+                * buses
             )))
             return stats
 
