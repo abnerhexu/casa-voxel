@@ -7,6 +7,7 @@ from tsim_components.dram_placement import (
     channel_aware_placements,
     channel_injection_nodes,
     clear_placement_cache,
+    exact_external_placements,
     placement_cache_info,
     record_signature,
     software_aware_placements,
@@ -59,6 +60,21 @@ def with_requesters(records, core=0):
 
 
 class DRAMPlacementTest(unittest.TestCase):
+    def test_exact_external_policy_preserves_declared_physical_banks(self):
+        records = [
+            {"tensor_id": "a#copy=0", "total_bytes": 1024,
+             "exact_bank_ids": [1, 5], "exact_channel_ids": [1]},
+            {"tensor_id": "a#copy=1", "total_bytes": 1024,
+             "exact_bank_ids": [2], "exact_channel_ids": [2]},
+        ]
+        plan = exact_external_placements(records, total_banks=8, num_channels=4)
+        self.assertEqual(plan[record_signature(records[0])].bank_ids, (1, 5))
+        self.assertEqual(plan[record_signature(records[1])].channel_ids, (2,))
+        through_public_api = build_placement_plan(
+            records, 8, 4, "exact_external"
+        )
+        self.assertEqual(through_public_api, plan)
+
     def test_channel_aware_is_an_independent_supported_policy(self):
         self.assertIn("software_aware", SUPPORTED_DRAM_PLACEMENTS)
         self.assertIn("channel_aware", SUPPORTED_DRAM_PLACEMENTS)
@@ -273,9 +289,15 @@ class DRAMPlacementTest(unittest.TestCase):
         records = make_records()
         for policy in SUPPORTED_DRAM_PLACEMENTS:
             with self.subTest(policy=policy):
-                policy_records = (
-                    with_requesters(records) if policy == "noc_aware" else records
-                )
+                if policy == "noc_aware":
+                    policy_records = with_requesters(records)
+                elif policy == "exact_external":
+                    policy_records = [
+                        {**record, "exact_bank_ids": [index]}
+                        for index, record in enumerate(records)
+                    ]
+                else:
+                    policy_records = records
                 plan = build_placement_plan(
                     policy_records, total_banks=16, num_channels=4,
                     policy=policy, seed=11, stripe_bytes=128,

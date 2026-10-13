@@ -20,6 +20,7 @@ RecordSignature = Tuple[str, int, int, str, str]
 
 SUPPORTED_DRAM_PLACEMENTS = frozenset({
     "address_trace",
+    "exact_external",
     "hbm_interleave",
     "uniform",
     "interleave_size",
@@ -144,6 +145,48 @@ def _rotating_indices(total: int, start: int, span: int) -> Tuple[int, ...]:
     span = max(1, min(total, int(span)))
     start = int(start) % total
     return tuple((start + offset) % total for offset in range(span))
+
+
+def exact_external_placements(
+    records: Iterable[Mapping[str, object]],
+    total_banks: int,
+    num_channels: int,
+) -> Dict[RecordSignature, TensorPlacement]:
+    """Validate and expose a caller-supplied physical block placement.
+
+    This policy performs no optimization.  It exists for architecture replay:
+    a higher-level mapper selects replicas, banks, and channels, while Voxel
+    retains authority over row/bus/NoC timing.  Every physical replica must
+    have a distinct record signature (normally via ``tensor_id`` or
+    ``block_id``) and declare ``exact_bank_ids``.
+    """
+    total_banks = max(1, int(total_banks))
+    num_channels = max(1, int(num_channels))
+    result: Dict[RecordSignature, TensorPlacement] = {}
+    for record in records:
+        signature = record_signature(record)
+        if signature in result:
+            raise ValueError(f"duplicate exact placement signature {signature}")
+        raw = record.get("exact_bank_ids")
+        if not isinstance(raw, (list, tuple)) or not raw:
+            raise ValueError(
+                f"exact placement {signature} needs nonempty exact_bank_ids"
+            )
+        banks = tuple(map(int, raw))
+        if len(banks) != len(set(banks)):
+            raise ValueError(f"exact placement {signature} repeats a bank")
+        if any(bank < 0 or bank >= total_banks for bank in banks):
+            raise ValueError(f"exact placement {signature} names an invalid bank")
+        channels = tuple(sorted({bank % num_channels for bank in banks}))
+        declared = record.get("exact_channel_ids")
+        if declared is not None and tuple(sorted(map(int, declared))) != channels:
+            raise ValueError(
+                f"exact placement {signature} channel declaration disagrees with banks"
+            )
+        result[signature] = TensorPlacement(
+            policy="exact_external", bank_ids=banks, channel_ids=channels,
+        )
+    return result
 
 
 def stable_u64(*parts: object) -> int:
@@ -708,6 +751,10 @@ def build_placement_plan(
     """
     records = tuple(records)
     normalized_policy = str(policy).lower().replace("-", "_")
+    if normalized_policy == "exact_external":
+        # Caller-supplied plans are deliberately not cached or coalesced: both
+        # operations could erase replica identity or return a stale mapping.
+        return exact_external_placements(records, total_banks, num_channels)
     # The paper-faithful software-aware policy needs every occurrence of a
     # tensor and its execution-stage metadata.  Coalescing to allocations here
     # would erase exactly the concurrency graph that drives the placement.
