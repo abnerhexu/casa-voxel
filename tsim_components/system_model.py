@@ -220,7 +220,9 @@ def validate_graph(graph, hw):
 
 class Layout:
     """Row-striped tensor storage with stable per-bank physical row extents."""
-    def __init__(self, tensors, mapping, hw):
+    def __init__(self, tensors, mapping, hw, *, enforce_capacity=True):
+        if type(enforce_capacity) is not bool:
+            raise ValueError("enforce_capacity must be boolean")
         if set(mapping) != set(tensors):
             raise ValueError("placement must cover exactly the graph tensors")
         self.hw, self.mapping, self.base = hw, {}, {}
@@ -236,7 +238,7 @@ class Layout:
                 count = max(0, (rows + len(banks)-1-ordinal)//len(banks))
                 self.base[tensor, bank] = cursor[bank]
                 cursor[bank] += count
-                if cursor[bank]*hw.row_bytes > hw.bank_capacity:
+                if enforce_capacity and cursor[bank]*hw.row_bytes > hw.bank_capacity:
                     raise Infeasible(f"bank {bank} capacity exceeded")
         self.bank_allocated_bytes = [c * hw.row_bytes for c in cursor]
 
@@ -297,7 +299,10 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
     if type(chunk_bytes) is not int or chunk_bytes <= 0 or max_tasks <= 0:
         raise ValueError("invalid chunk/task bound")
     writers = validate_graph(graph, hw)
-    layout = Layout(graph["tensors"], mapping, hw)
+    layout = Layout(
+        graph["tensors"], mapping, hw,
+        enforce_capacity=graph.get("enforce_dram_capacity", True),
+    )
     resident = resident or {}
     persistent = [0]*hw.cores
     for tensor, cores in resident.items():

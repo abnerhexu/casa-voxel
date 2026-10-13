@@ -47,6 +47,28 @@ class ExactReplayTest(unittest.TestCase):
         self.assertEqual(replay["critical_tsv_bytes"], 768)
         self.assertEqual(sum(result["metrics"]["channel_bytes"].values()), 1280)
         self.assertGreater(result["metrics"]["cycles"], 0)
+        self.assertTrue(replay["dram_capacity_feasible"])
+
+    def test_large_block_stripes_within_portal_and_reports_capacity(self):
+        record = {
+            "demand_id": "large", "tensor_id": "A", "kind": "read",
+            "replica_id": 0, "portal": 0, "portal_node": 0, "bank": 2,
+            "num_bytes": 2048, "allocation_bytes": 2048, "live_bytes": 128,
+            "live_start": 0, "live_end": 1, "consumers": [0],
+            "assigned_consumers": [0], "producers": [],
+        }
+        hardware = Hardware(
+            cores=2, mesh_width=2, banks=4, channels=1, row_bytes=128,
+            bank_capacity=384, sram_bytes=4096, channel_nodes=(0,),
+        )
+        result = replay_exact_placement(
+            [record], hardware, compute_cores=(0,), compute_cycles=1,
+            scratch_bytes_per_core=128, source_policy="striped_single",
+        )
+        self.assertEqual(result["exact_replay"]["channel_load_bytes"], [2048])
+        self.assertFalse(result["exact_replay"]["dram_capacity_feasible"])
+        self.assertEqual(result["exact_replay"]["capacity_overflow_banks"], 4)
+        self.assertEqual(result["bank_allocated_bytes"], [512] * 4)
 
     def test_wrong_bank_channel_mapping_is_rejected(self):
         record = {

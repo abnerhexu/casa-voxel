@@ -171,6 +171,25 @@ def build_exact_replay_graph(
             "record_count": len(records),
         },
     }
+    # CASA's bank value is a stream color / first bank, not a declaration
+    # that a potentially multi-GiB affine block resides in one bank.  Stripe
+    # each physical replica across every bank attached to its selected portal,
+    # rotating the chosen color to the first position.  This preserves the
+    # exact TSV-channel vector while giving Voxel physical bank parallelism.
+    for descriptor, record in zip(placement_inputs, sorted(
+        records, key=lambda row: (str(row.get("demand_id")), int(row.get("replica_id", -1)))
+    )):
+        portal = int(record["portal"])
+        first_bank = int(record["bank"])
+        portal_banks = [
+            bank for bank in range(total_banks) if bank % num_channels == portal
+        ]
+        if first_bank not in portal_banks:
+            raise ValueError("exact placement bank is not attached to its declared portal")
+        offset = portal_banks.index(first_bank)
+        striped = portal_banks[offset:] + portal_banks[:offset]
+        descriptor["exact_bank_ids"] = striped
+
     plan = build_placement_plan(
         placement_inputs,
         total_banks=total_banks,
@@ -180,6 +199,13 @@ def build_exact_replay_graph(
     for descriptor in placement_inputs:
         signature = record_signature(descriptor)
         mapping[str(descriptor["tensor_id"])] = plan[signature].bank_ids
+    # Exact replay is also used for logical streaming traces whose complete
+    # affine address footprint need not be simultaneously resident.  Voxel
+    # reports physical capacity feasibility after laying out the trace rather
+    # than aborting before timing it.  Callers must not present an infeasible
+    # point as a realizable full-materialization design.
+    graph["enforce_dram_capacity"] = False
+    graph["exact_replay"]["capacity_semantics"] = "reported_not_enforced"
     return {"graph": graph, "mapping": mapping, "placement_records": records}
 
 
@@ -221,6 +247,8 @@ def replay_exact_placement(
         paradigm="compute_shift", trace=trace, max_tasks=max_tasks,
     )
     metrics = result["metrics"]
+    bank_allocated = list(map(int, result.get("bank_allocated_bytes", ())))
+    overflow = [max(0, value - hardware.bank_capacity) for value in bank_allocated]
     expected_channels = [0] * hardware.channels
     expected_links: Counter[tuple[int, int]] = Counter()
     reduced_demands = set()
@@ -266,5 +294,14 @@ def replay_exact_placement(
         "critical_tsv_bytes": max(actual_channels, default=0),
         "critical_noc_link_bytes": max(actual_links.values(), default=0),
         "traffic_invariants_passed": True,
+        "dram_capacity_enforced": False,
+        "dram_capacity_feasible": not any(overflow),
+        "bank_capacity_bytes": hardware.bank_capacity,
+        "maximum_bank_allocated_bytes": max(bank_allocated, default=0),
+        "capacity_overflow_bytes": sum(overflow),
+        "capacity_overflow_banks": sum(value > 0 for value in overflow),
     }
+    result.setdefault("limitations", []).append(
+        "exact streaming replay reports but does not enforce DRAM capacity"
+    )
     return result

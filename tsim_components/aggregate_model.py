@@ -67,7 +67,10 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
     if max_tasks < 1 or chunk_bytes < 1:
         raise ValueError("invalid task/chunk bound")
     writers = validate_graph(graph,hw)
-    layout = Layout(graph["tensors"],mapping,hw)
+    layout = Layout(
+        graph["tensors"], mapping, hw,
+        enforce_capacity=graph.get("enforce_dram_capacity", True),
+    )
     resident = resident or {}
     persistent = [0]*hw.cores
     for tensor,cores in resident.items():
