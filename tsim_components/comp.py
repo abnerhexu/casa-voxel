@@ -441,7 +441,7 @@ class Compute:
         else:
             default_reuse = float(self.mm_reuse_list[0]) if self.mm_reuse_list else 1.0
             arch_reuse_np_out_in_in = np.array([default_reuse, default_reuse, default_reuse], dtype=float)
-        if self.mm_input_a_reuse_policy == "tile":
+        if getattr(self, "mm_input_a_reuse_policy", "tile") == "tile":
             arch_reuse_np_out_in_in[1] = n
 
         # Maximum tile-level reuse along each operand's contraction axis.

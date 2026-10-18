@@ -34,6 +34,10 @@ def test_input_a_policy_and_legacy_default():
     assert low.get_mm_load_store_cycles_from_padded_bkmn((1,16,16,16))[1] == 4*high.get_mm_load_store_cycles_from_padded_bkmn((1,16,16,16))[1]
     np.testing.assert_equal(compute().get_mm_load_store_cycles_from_padded_bkmn((1,16,16,16)), high.get_mm_load_store_cycles_from_padded_bkmn((1,16,16,16)))
     assert summary(spec(), low)["local_sram_read_bytes"] > summary(spec(), high)["local_sram_read_bytes"]
+    legacy = compute()
+    del legacy.mm_input_a_reuse_policy  # Attribute absent in old pickles.
+    np.testing.assert_equal(legacy.get_mm_load_store_cycles_from_padded_bkmn((1,16,16,16)),
+                            compute().get_mm_load_store_cycles_from_padded_bkmn((1,16,16,16)))
 
 
 @pytest.mark.parametrize("backend", ["aggregate", "affine"])
