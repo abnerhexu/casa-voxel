@@ -26,6 +26,7 @@ def summary(spec, comp):
         histograms.append(lengths)
     ndim, nvars = len(histograms), len(spec["variables"])
     total, work, peak = 0, 0, 0
+    mm_cycles = ew_cycles = read_cycles = write_cycles = 0.0
     for items in product(*(h.items() for h in histograms)):
         shape, counts = zip(*items)
         count = math.prod(counts)
@@ -33,7 +34,13 @@ def summary(spec, comp):
             variables=[np.array([[d] for d in axes]) for axes in spec["variables"]],
             is_ew=spec["op_type"] != 5, ignore_variables=[False]*nvars,
             tensor_id_list=list(range(nvars)), op_type=spec["op_type"])
-        total += count*math.ceil(comp.get_total_cycle_for_fused_op([op], [[[1]*nvars for _ in range(ndim)]])[0])
+        components = comp.get_total_cycle_for_fused_op([op], [[[1]*nvars for _ in range(ndim)]])
+        total += count*math.ceil(components[0])
+        if len(components) >= 5:
+            mm_cycles += count * components[1]
+            ew_cycles += count * components[2]
+            read_cycles += count * components[3]
+            write_cycles += count * components[4]
         work += count*math.prod(shape)*(2 if spec["op_type"] == 5 else 1)
         peak = max(peak,4*spec["element_bytes"]*sum(math.prod(shape[d] for d in axes) for axes in spec["variables"]))
     if work != math.prod(spec["dims"])*(2 if spec["op_type"] == 5 else 1):
@@ -45,7 +52,11 @@ def summary(spec, comp):
     reduction_cycles = math.ceil((passes[0]-1)*(output_bytes//spec["element_bytes"])/comp.get_peak_flopc()[1])
     return dict(total_core_cycles=total, reduction_core_cycles=reduction_cycles,
                 work=work, scratch_bytes_per_core=peak, passes=passes,
-                cells=math.prod(cell_counts))
+                cells=math.prod(cell_counts), mm_core_cycles=mm_cycles,
+                ew_core_cycles=ew_cycles, local_sram_read_core_cycles=read_cycles,
+                local_sram_write_core_cycles=write_cycles,
+                local_sram_read_bytes=round(read_cycles * getattr(comp, "load_store_bw_bytepc", 0)),
+                local_sram_write_bytes=round(write_cycles * getattr(comp, "load_store_bw_bytepc", 0)))
 
 
 def movement_profile(spec, comp, hw):

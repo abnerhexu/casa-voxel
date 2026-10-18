@@ -61,7 +61,9 @@ def row_events(seen, previous, previous_tensor, tensor, first, rows, passes):
 
 def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
             resident=None, counterfactual="none", fixed_bank_order=None,
-            trace=False, max_tasks=2_000_000):
+            trace=False, max_tasks=2_000_000, noc_ideal="none", overlap=True):
+    if noc_ideal not in ("none", "reuse", "all") or type(overlap) is not bool:
+        raise ValueError("invalid NoC/overlap counterfactual")
     if paradigm not in ("spmd","dataflow","compute_shift") or counterfactual not in ("none","all_conflicts",*KINDS):
         raise ValueError("unknown paradigm/counterfactual")
     if max_tasks < 1 or chunk_bytes < 1:
@@ -112,13 +114,15 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
         resources,links = path_resources(src,dst)
         if not resources:
             return earliest
-        duration = math.ceil(size/hw.noc_bytepc)
-        _,finish = reserve(resources,earliest,duration)
+        ideal = noc_ideal == "all" or (noc_ideal == "reuse" and category not in ("dram_read", "dram_write"))
+        duration = 0 if ideal else math.ceil(size/hw.noc_bytepc)
+        finish = earliest if ideal else reserve(resources,earliest,duration)[1]
         for link in links:
             link_bytes[link] += size
         traffic["noc_byte_hops"] += size*len(links)
         traffic[category+"_byte_hops"] += size*len(links)
-        return finish+len(links)*hw.router_cycles
+        traffic[category+"_bytes"] += size
+        return finish+(0 if ideal else len(links)*hw.router_cycles)
 
     def memory(access, earliest, token):
         nonlocal descriptors
@@ -180,7 +184,7 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
         # Fixed topology, independent of counterfactual durations; no claim of
         # free dynamic rescheduling. Aggregate fixed-order contrast is exact
         # for this declared schedule, not the fine backend's scheduler.
-        job = min(eligible,key=lambda j:j["id"])
+        job = min(eligible,key=lambda j:(j.get("schedule_priority", 0), j["id"]))
         key = job["id"]
         release = max([job_end[d] for d in job.get("deps",[])]+[0])
         scratch = job.get("scratch_bytes_per_core",0)
@@ -211,7 +215,7 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
             cursor = flows("broadcast",cursor)
             shifted = flows("shift",cursor)
             _,computed = reserve([f"core:{c}" for c in step.get("cores",job["cores"])],
-                shifted if paradigm == "spmd" else cursor,step["compute_cycles"])
+                shifted if paradigm == "spmd" or not overlap else cursor,step["compute_cycles"])
             cursor = flows("reduce",max(shifted,computed))
             _,cursor = reserve([f"core:{c}" for c in step.get("reduce_cores",job["cores"])],cursor,step.get("reduce_compute_cycles",0))
             writes = [cursor]
@@ -243,6 +247,7 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
         groups[str(j.get("microbatch",0))].append(job_end[j["id"]])
     completions = sorted(max(v) for v in groups.values())
     return dict(model="l3_aggregate_row_run_v1",paradigm=paradigm,counterfactual=counterfactual,
+        noc_ideal=noc_ideal, overlap=overlap,
         chunk_bytes=chunk_bytes,bank_order=signature,bank_allocated_bytes=layout.bank_allocated_bytes,trace=log,
         metrics=dict(cycles=makespan,milliseconds=makespan/(1000*hw.frequency_mhz),row=dict(counts),
             conflict_types={k:conflicts[k] for k in KINDS},traffic=dict(traffic),movement_energy_pj=energy,

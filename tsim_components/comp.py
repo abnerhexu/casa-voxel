@@ -153,7 +153,8 @@ class Compute:
                  mm_init_cycle: int = 0,
                  ew_mm_overlap: bool = True,
                  use_ipu_cost: bool = False,
-                 use_ipu_pad: bool = False) -> None:
+                 use_ipu_pad: bool = False,
+                 mm_input_a_reuse_policy: str = "tile") -> None:
         """
         Args:
             ew_pad_len: Minimum element-wise tile length required by the
@@ -192,6 +193,14 @@ class Compute:
         self.ew_mm_overlap = ew_mm_overlap
         self.use_ipu_cost = use_ipu_cost
         self.use_ipu_pad = use_ipu_pad
+        if mm_input_a_reuse_policy not in ("tile", "configured"):
+            raise ValueError("mm_input_a_reuse_policy must be tile or configured")
+        if load_store_bw_bytepc <= 0 or any(r <= 0 for r in mm_reuse_list):
+            raise ValueError("SRAM bandwidth and reuse factors must be positive")
+        # Legacy cores retain A across the entire N extent. Experiments may
+        # explicitly select finite configured reuse instead of silently
+        # overwriting mm_reuse_list[1]. Default behavior is unchanged.
+        self.mm_input_a_reuse_policy = mm_input_a_reuse_policy
 
         if use_ipu_pad:
             self.mm_flopc = IPU_MM_FLOPC
@@ -432,7 +441,8 @@ class Compute:
         else:
             default_reuse = float(self.mm_reuse_list[0]) if self.mm_reuse_list else 1.0
             arch_reuse_np_out_in_in = np.array([default_reuse, default_reuse, default_reuse], dtype=float)
-        arch_reuse_np_out_in_in[1] = n
+        if self.mm_input_a_reuse_policy == "tile":
+            arch_reuse_np_out_in_in[1] = n
 
         # Maximum tile-level reuse along each operand's contraction axis.
         tile_reuse_np_out_in_in = np.array([k, n, m])

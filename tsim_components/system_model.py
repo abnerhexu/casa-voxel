@@ -277,7 +277,7 @@ class Layout:
 
 def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
             resident=None, counterfactual="none", fixed_bank_order=None,
-            trace=False, max_tasks=2_000_000):
+            trace=False, max_tasks=2_000_000, noc_ideal="none", overlap=True):
     """Execute an explicit graph, returning system metrics and optional trace.
 
     Resident copies reserve their full sizes for the complete run. Initial
@@ -290,7 +290,9 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
         from .aggregate_model import execute as aggregate_execute
         return aggregate_execute(graph,hw,mapping,paradigm=paradigm,chunk_bytes=chunk_bytes,
             resident=resident,counterfactual=counterfactual,fixed_bank_order=fixed_bank_order,
-            trace=trace,max_tasks=max_tasks)
+            trace=trace,max_tasks=max_tasks,noc_ideal=noc_ideal,overlap=overlap)
+    if noc_ideal not in ("none", "reuse", "all") or type(overlap) is not bool:
+        raise ValueError("invalid NoC/overlap counterfactual")
     if paradigm not in ("spmd", "dataflow", "compute_shift"):
         raise ValueError("unknown paradigm")
     kinds = ("stream", "inter_tensor", "revisit", "other")
@@ -416,7 +418,7 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
                 return add(f"{prefix}/{phase}_done", deps=tails or deps)
             broadcast = flows("broadcast", [read_done])
             shift = flows("shift", [broadcast])
-            compute = add(f"{prefix}/compute", "compute", [shift if paradigm == "spmd" else broadcast],
+            compute = add(f"{prefix}/compute", "compute", [shift if paradigm == "spmd" or not overlap else broadcast],
                           cores=step.get("cores", j["cores"]), duration=step["compute_cycles"], job=key)
             reduce = flows("reduce", [compute, shift])
             if step.get("reduce_compute_cycles", 0):
@@ -521,13 +523,16 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
             elif kind == "network":
                 cursor = now
                 links = route(t["src"], t["dst"], hw)
+                ideal = noc_ideal == "all" or (noc_ideal == "reuse" and t["category"] not in ("dram_read", "dram_write"))
                 for src, dst in links:
-                    _, cursor = reserve([f"link:{src}:{dst}"], cursor,
-                                        math.ceil(t["bytes"]/hw.noc_bytepc)+hw.router_cycles, key)
+                    if not ideal:
+                        _, cursor = reserve([f"link:{src}:{dst}"], cursor,
+                                            math.ceil(t["bytes"]/hw.noc_bytepc)+hw.router_cycles, key)
                     link_bytes[f"{src}:{dst}"] += t["bytes"]
                 finish = cursor
                 traffic[f"{t['category']}_byte_hops"] += t["bytes"]*len(links)
                 traffic["noc_byte_hops"] += t["bytes"]*len(links)
+                traffic[f"{t['category']}_bytes"] += t["bytes"]
                 detail["hops"] = len(links)
             elif kind == "memory":
                 bank, row, n = t["bank"], t["row"], t["rows"]
@@ -599,6 +604,7 @@ def execute(graph, hw, mapping, *, paradigm="compute_shift", chunk_bytes=8192,
         groups[str(j.get("microbatch", 0))].append(job_end[j["id"]])
     completions = sorted(max(v) for v in groups.values())
     return dict(model="l3_absolute_reservation_v2", paradigm=paradigm,
+                noc_ideal=noc_ideal, overlap=overlap,
                 counterfactual=counterfactual, chunk_bytes=chunk_bytes,
                 metrics=dict(cycles=makespan, milliseconds=makespan/(1000*hw.frequency_mhz),
                              row=dict(counts), conflict_types={k: conflicts[k] for k in kinds},
